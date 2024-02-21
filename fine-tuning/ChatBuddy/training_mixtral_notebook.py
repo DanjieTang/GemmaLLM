@@ -11,12 +11,14 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import os
 from accelerate import PartialState
 
+# If you are using 4000 series gpu
 os.environ["NCCL_P2P_DISABLE"]="1"
 os.environ["NCCL_IB_DISABLE"]="1"
+multi_gpu = True
 
 model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-max_token = 1024
+max_token = 256
 
 # Instantiate the tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -25,7 +27,7 @@ data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
 # Tokenization functions
 def tokenize_function(row):
-    return tokenizer(row["dialog"], max_length=max_token, truncation=False)
+    return tokenizer(row["dialog"])
 
 def is_shorter_than_max_token(row):
     """
@@ -102,7 +104,10 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.bfloat16
 )
     
-model = AutoModelForCausalLM.from_pretrained(model_name, device_map={"": PartialState().process_index}, quantization_config=bnb_config)
+if multi_gpu:
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map={"": PartialState().process_index}, quantization_config=bnb_config)
+else:
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", quantization_config=bnb_config)
 model.resize_token_embeddings(len(tokenizer))
 model = prepare_model_for_kbit_training(model)
 
@@ -117,21 +122,37 @@ config = LoraConfig(
 
 model = get_peft_model(model, config)
 
-training_args = TrainingArguments(
-    output_dir="output_dir",
-    per_device_train_batch_size=10,
-    gradient_accumulation_steps=10,
-    num_train_epochs=1,
-    learning_rate=1e-4,
-    evaluation_strategy="steps",
-    eval_steps=0.25,
-    warmup_steps=50,
-    weight_decay=1e-3,
-    optim="paged_adamw_32bit",
-    group_by_length=True,
-    lr_scheduler_type="cosine",
-    ddp_find_unused_parameters=False
-)
+if multi_gpu:
+    training_args = TrainingArguments(
+        output_dir="output_dir",
+        per_device_train_batch_size=10,
+        gradient_accumulation_steps=10,
+        num_train_epochs=1,
+        learning_rate=1e-4,
+        evaluation_strategy="steps",
+        eval_steps=0.25,
+        warmup_steps=50,
+        weight_decay=1e-3,
+        optim="paged_adamw_32bit",
+        group_by_length=True,
+        lr_scheduler_type="cosine",
+        ddp_find_unused_parameters=False
+    )
+else:
+    training_args = TrainingArguments(
+        output_dir="output_dir",
+        per_device_train_batch_size=10,
+        gradient_accumulation_steps=10,
+        num_train_epochs=1,
+        learning_rate=1e-4,
+        evaluation_strategy="steps",
+        eval_steps=0.25,
+        warmup_steps=50,
+        weight_decay=1e-3,
+        optim="paged_adamw_32bit",
+        group_by_length=True,
+        lr_scheduler_type="cosine",
+    )
 
 trainer = Trainer(
     model=model,
