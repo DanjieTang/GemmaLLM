@@ -11,9 +11,10 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 #     bnb_4bit_compute_dtype=torch.bfloat16
 # )
 model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
-model.save_pretrained("test")
+# model.save_pretrained("testing_load_model")
+# tokenizer.save_pretrained("testing_load_model")
 
-# inputs = tokenizer("Hello", return_tensors="pt", return_attention_mask=False)
-# outputs = model.generate(**inputs, max_length=20)
-# text = tokenizer.batch_decode(outputs)[0]
-# print(text)
+inputs = tokenizer("Hello", return_tensors="pt", return_attention_mask=False)
+outputs = model.generate(**inputs, max_length=20)
+text = tokenizer.batch_decode(outputs)[0]
+print(text)
