@@ -18,3 +18,14 @@
 
     b) 216 million pre-train tokens.
 
+## Training detail.
+
+    a) 2 Million parameters
+
+    b) Contextual length of 32 tokens.
+
+## Next step.
+
+    a) Increase pre-train data.
+
+    b) Increase context length.
