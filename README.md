@@ -4,13 +4,15 @@
 
 ## Key insights from this implementation.
 
-    a)RMS Normalization (Zhang and Sennrich, 2019)
+    a)RMS Normalization
 
-    b)ROPE Embedding (Shazeer, 2019)
+    b)ROPE Embedding
 
-    c)MultiQueryAttention (Shazeer, 2019)
+    c)MultiQueryAttention
 
-    d)GeGLU Activations (Shazeer, 2020)
+    d)GeGLU Activations
+
+    e)Pre-Norm Transformers
 
 ## Training data.
 
