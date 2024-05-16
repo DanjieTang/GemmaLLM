@@ -2,6 +2,12 @@
 
 # My implementation of the Gemma LLM.
 
+## Training data.
+
+    a) All English Wikipedia pages(6.5 million).
+
+    b) ~2 billion tokens.
+
 ## Key insights from this implementation.
 
     a)RMS Normalization
@@ -14,20 +20,8 @@
 
     e)Pre-Norm Transformers
 
-## Training data.
-
-    a) Extracted data from 200 thousand Wikipedia websites.
-
-    b) 216 million pre-train tokens.
-
 ## Training detail.
 
     a) 2 Million parameters
 
-    b) Contextual length of 32 tokens.
-
-## Next step.
-
-    a) Increase pre-train data.
-
-    b) Increase context length.
+    b) Contextual length of 64 tokens.
