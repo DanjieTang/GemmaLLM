@@ -59,8 +59,8 @@ def train():
 
         gemma.train()
         for data in tqdm(training_loader, desc=f"Training Epoch {epoch+1}/{EPOCHS}"):
-            input_data = data[0][:, :-1].cuda(DEVICE_ID)
-            target_data = data[0][:, 1:].cuda(DEVICE_ID)
+            input_data = data[0][:, :-1].long().cuda(DEVICE_ID)
+            target_data = data[0][:, 1:].long().cuda(DEVICE_ID)
 
             input_embeddings = word_embeddings_tensor[input_data]
 
@@ -90,6 +90,7 @@ def train():
         gemma.eval()
         with torch.no_grad():
             for data in tqdm(validation_loader, desc=f"Validation Epoch {epoch+1}/{EPOCHS}"):
+                data = data.long()
                 input_data = data[0][:, :-1].cuda(DEVICE_ID)
                 target_data = data[0][:, 1:].cuda(DEVICE_ID)
 
