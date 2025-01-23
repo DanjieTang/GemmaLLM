@@ -20,8 +20,12 @@
 
     e)Pre-Norm Transformers
 
+    f)Mixtral of Experts
+
+    g)LoRA: Low-Rank Adaptation of Large Language Models
+
 ## Training detail.
 
-    a) 2 Million parameters
+    a) 6.6 Million parameters Mixture of Experts Architecture
 
     b) Contextual length of 64 tokens.
