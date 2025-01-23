@@ -26,6 +26,6 @@
 
 ## Training detail.
 
-    a) 6.6 Million parameters Mixture of Experts Architecture
+    a) 665 Million parameters Mixture of Experts Architecture
 
     b) Contextual length of 64 tokens.
