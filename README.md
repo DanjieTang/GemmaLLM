@@ -24,6 +24,10 @@
 
     g)LoRA: Low-Rank Adaptation of Large Language Models
 
+    h)Gated Attention for Large Language Models
+
+    i)Late fusion for LLM image capability
+
 ## Training detail.
 
     a) 665 Million parameters Mixture of Experts Architecture
