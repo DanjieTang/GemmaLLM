@@ -120,6 +120,25 @@ def normalize_grid(config: OrderedDict) -> Tuple[List[str], List[List]]:
     return keys, value_lists
 
 
+def get_varying_keys(config: OrderedDict) -> List[str]:
+    varying_keys = []
+    for key, value in config.items():
+        if isinstance(value, list) and len(value) > 1:
+            varying_keys.append(key)
+    return varying_keys
+
+
+def make_run_name(params: Dict, varying_keys: List[str]) -> str:
+    if not varying_keys:
+        return "default"
+
+    parts = []
+    for key in varying_keys:
+        value = params.get(key)
+        parts.append(f"{key}-{value}")
+    return "-".join(parts)
+
+
 def to_run_id(params: Dict) -> str:
     return json.dumps(params, sort_keys=True, separators=(",", ":"))
 
@@ -141,12 +160,15 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_command(python_exe: str, train_script: Path, params: Dict) -> List[str]:
+def build_command(
+    python_exe: str, train_script: Path, params: Dict, run_name: str
+) -> List[str]:
     cmd = [python_exe, str(train_script)]
     for key, value in params.items():
         if value is None:
             continue
         cmd.extend([f"--{key}", str(value)])
+    cmd.extend(["--run_name", run_name])
     return cmd
 
 
@@ -171,6 +193,7 @@ def main():
         )
 
     keys, value_lists = normalize_grid(config)
+    varying_keys = get_varying_keys(config)
     combos = [dict(zip(keys, values)) for values in itertools.product(*value_lists)]
 
     state = load_state(state_path)
@@ -197,9 +220,11 @@ def main():
             print(f"[{idx}/{total}] SKIP completed: {params}")
             continue
 
-        cmd = build_command(args.python, train_script, params)
+        run_name = make_run_name(params, varying_keys)
+        cmd = build_command(args.python, train_script, params, run_name)
         pretty_cmd = " ".join(cmd)
         print(f"[{idx}/{total}] RUN: {params}")
+        print(f"Run name: {run_name}")
         print(f"Command: {pretty_cmd}")
 
         if args.dry_run:

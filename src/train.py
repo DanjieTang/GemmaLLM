@@ -39,6 +39,7 @@ def parse_args():
     # WandB
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--entity", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default=None)
     
     return parser.parse_args()
 
@@ -50,18 +51,23 @@ def main():
     use_wandb = args.project is not None and args.entity is not None
 
     if use_wandb:
-        run = wandb.init(entity=args.entity, project=args.project, config={
-            "num_layer": args.num_layer,
-            "max_context_length": args.max_context_length,
-            "projection_dim": args.projection_dim,
-            "expansion_factor": args.expansion_factor,
-            "q_head": args.q_head,
-            "kv_head": args.kv_head,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay
-        })
+        run = wandb.init(
+            entity=args.entity,
+            project=args.project,
+            name=args.run_name,
+            config={
+                "num_layer": args.num_layer,
+                "max_context_length": args.max_context_length,
+                "projection_dim": args.projection_dim,
+                "expansion_factor": args.expansion_factor,
+                "q_head": args.q_head,
+                "kv_head": args.kv_head,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+            },
+        )
 
     train_loader, val_loader = prepare_dataset(args.train_path, args.val_path, args.batch_size, args.batch_size)
 
@@ -95,8 +101,12 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         epoch_train_loss = []
+        counter = 0
 
         for data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]"):
+            counter += 1
+            if counter == 100:
+                break
             # Teacher forcing
             input_data = data[:, :-1].long().to(args.device)
             target_data = data[:, 1:].long().to(args.device)
@@ -125,6 +135,9 @@ def main():
         epoch_val_loss = []
         with torch.no_grad():
             for data in tqdm(val_loader, desc="Validating"):
+                counter += 1
+                if counter == 200:
+                    break
                 # Teacher forcing
                 input_data = data[:, :-1].long().to(args.device)
                 target_data = data[:, 1:].long().to(args.device)
