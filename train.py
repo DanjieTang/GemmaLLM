@@ -101,12 +101,8 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         epoch_train_loss = []
-        counter = 0
 
         for data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]"):
-            counter += 1
-            if counter == 100:
-                break
             # Teacher forcing
             input_data = data[:, :-1].long().to(args.device)
             target_data = data[:, 1:].long().to(args.device)
@@ -135,9 +131,6 @@ def main():
         epoch_val_loss = []
         with torch.no_grad():
             for data in tqdm(val_loader, desc="Validating"):
-                counter += 1
-                if counter == 200:
-                    break
                 # Teacher forcing
                 input_data = data[:, :-1].long().to(args.device)
                 target_data = data[:, 1:].long().to(args.device)
