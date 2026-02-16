@@ -7,116 +7,149 @@ from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
+
+import wandb
 
 torch.manual_seed(0)
 
-if __name__ == "__main__":
-    # Hyperparameters
-    max_context_length = 51
-    device = "mps"
-    epochs = 1
-    train_batch_size = 256
-    val_batch_size = 256
-    weight_decay = 1e-3
-    lr = 1e-3
-    num_layer = 3
-    head_dim = 64
-    projection_dim = 512
-    expansion_factor = 16
-    checkpoint_filepath = ""
-    q_head = 8
-    kv_head = 4
-    train_data_path = "languages_tokenized_50_train.npy"
-    val_data_path = "languages_tokenized_50_eval.npy"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a VLM Model")
 
-    train_loader, val_loader = prepare_dataset(train_data_path, val_data_path, train_batch_size, val_batch_size)
+    # Dataset & Paths
+    parser.add_argument("--train_path", type=str, default="languages_tokenized_50_train.npy")
+    parser.add_argument("--val_path", type=str, default="languages_tokenized_50_eval.npy")
+    parser.add_argument("--embeddings_path", type=str, default="word_embeddings_tensor_llama3.pt")
+    
+    # Model Architecture
+    parser.add_argument("--num_layer", type=int, default=3)
+    parser.add_argument("--max_context_length", type=int, default=51)
+    parser.add_argument("--projection_dim", type=int, default=512)
+    parser.add_argument("--expansion_factor", type=int, default=16)
+    parser.add_argument("--q_head", type=int, default=8)
+    parser.add_argument("--kv_head", type=int, default=4)
+    
+    # Training Hyperparameters
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    
+    # WandB
+    parser.add_argument("--project", type=str, default="VLM")
+    parser.add_argument("--entity", type=str, default="danjie-tang")
+    
+    return parser.parse_args()
 
-    vit = VLM(num_layer, max_context_length, 'word_embeddings_tensor_llama3.pt', projection_dim=projection_dim, expansion_factor=expansion_factor, use_moe=False, q_head=q_head, kv_head=kv_head, device=device).to(device)
+def main():
+    args = parse_args()
+    torch.manual_seed(0)
 
+    run = wandb.init(entity=args.entity, project=args.project, config={
+        "num_layer": args.num_layer,
+        "max_context_length": args.max_context_length,
+        "projection_dim": args.projection_dim,
+        "expansion_factor": args.expansion_factor,
+        "q_head": args.q_head,
+        "kv_head": args.kv_head,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay
+    })
+
+    train_loader, val_loader = prepare_dataset(args.train_path, args.val_path, args.batch_size, args.batch_size)
+
+    model = VLM(
+        num_layer=args.num_layer,
+        max_context_length=args.max_context_length,
+        embeddings_path=args.embeddings_path,
+        projection_dim=args.projection_dim,
+        expansion_factor=args.expansion_factor,
+        use_moe=False,
+        q_head=args.q_head,
+        kv_head=args.kv_head,
+        device=args.device
+    ).to(args.device)
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Optimizer & Schedulers
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(vit.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # Initialize the learning rate scheduler
-    total_steps = epochs*len(train_loader)
+    total_steps = args.epochs * len(train_loader)
     warmup_steps = int(total_steps * 0.01)
 
-    # Warmup: LR linearly increases from 0 → base LR over warmup_steps
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-
-    # Cosine annealing: after warmup
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=(total_steps - warmup_steps), eta_min=3e-5)
-
-    # Combine them
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
-    # if checkpoint_filepath != None and checkpoint_filepath != "":
-    #     current_epoch = load_checkpoint(llm, optimizer, checkpoint_filepath) + 1
-    # else:
-    #     current_epoch = 0
-    current_epoch = 0
+    # Tracking metrics
+    train_losses, val_losses = [], []
 
-    print("This model has", sum(p.numel() for p in vit.parameters()), "parameters.")
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_train_loss = []
 
-    loss_train = []
-    loss_valid = []
-
-    for epoch in range(current_epoch, epochs):
-        loss_train_epoch = []
-        loss_val_epoch = []
-
-        vit.train()
-        for data in tqdm(train_loader):
+        for data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]"):
             # Teacher forcing
-            input_data = data[:, :-1].long().to(device)
-            target_data = data[:, 1:].long().to(device)
+            input_data = data[:, :-1].long().to(args.device)
+            target_data = data[:, 1:].long().to(args.device)
 
             # Forward pass
-            prediction, load_balancing_loss = vit(input_data, [None] * input_data.shape[0])
+            prediction, load_balancing_loss = model(input_data, [None] * input_data.shape[0])
 
             # Change shape for loss calculation
             prediction = prediction.view(-1, prediction.shape[-1])
             target_data = target_data.reshape(-1)
-
-            loss = criterion(prediction, target_data) + load_balancing_loss # Calculate loss
+            loss = criterion(prediction, target_data) + load_balancing_loss
             
             # Backward pass
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-
-            # Record loss
-            loss_train_epoch.append(loss.item())
             scheduler.step()
 
-        loss_train.append(np.mean(loss_train_epoch))
+            # Record loss
+            epoch_train_loss.append(loss.item())
+        
+        avg_train_loss = np.mean(epoch_train_loss)
+        train_losses.append(avg_train_loss)
 
-        vit.eval()
+        model.eval()
+        epoch_val_loss = []
         with torch.no_grad():
-            for data in tqdm(val_loader):
+            for data in tqdm(val_loader, desc="Validating"):
                 # Teacher forcing
-                input_data = data[:, :-1].long().to(device)
-                target_data = data[:, 1:].long().to(device)
+                input_data = data[:, :-1].long().to(args.device)
+                target_data = data[:, 1:].long().to(args.device)
 
                 # Forward pass
-                prediction, load_balancing_loss = vit(input_data, [None] * input_data.shape[0])
+                prediction, load_balancing_loss = model(input_data, [None] * input_data.shape[0])
 
                 # Change shape for loss calculation
                 prediction = prediction.view(-1, prediction.shape[-1])
                 target_data = target_data.reshape(-1)
-
                 loss = criterion(prediction, target_data) + load_balancing_loss # Calculate loss
 
                 # Record loss
-                loss_val_epoch.append(loss.item())
+                epoch_val_loss.append(loss.item())
 
-            loss_valid.append(np.mean(loss_val_epoch))
+        avg_val_loss = np.mean(epoch_val_loss)
+        val_losses.append(avg_val_loss)
 
-        # Save checkpoint
-        save_checkpoint(vit, optimizer, epoch, loss_valid[-1])
+        print(f"Epoch {epoch}: Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f}")
+        run.log({"Training Loss": train_losses[-1], "Val loss": val_losses[-1]})
 
-        plt.plot(loss_train, label="Training loss")
-        plt.plot(loss_valid, label="Validation loss")
-        print("Training loss: ", loss_train[-1])
-        print("Validation loss: ", loss_valid[-1])
-        plt.legend()
-        plt.show()
+    plt.plot(train_losses, label="Training loss")
+    plt.plot(val_losses, label="Validation loss")
+    print("Training loss: ", train_losses[-1])
+    print("Validation loss: ", val_losses[-1])
+    plt.legend()
+    plt.show()
+
+    run.finish()
+
+if __name__ == "__main__":
+    main()
