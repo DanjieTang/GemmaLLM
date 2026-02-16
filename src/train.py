@@ -37,8 +37,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     
     # WandB
-    parser.add_argument("--project", type=str, default="VLM")
-    parser.add_argument("--entity", type=str, default="danjie-tang")
+    parser.add_argument("--project", type=str, default=None)
+    parser.add_argument("--entity", type=str, default=None)
     
     return parser.parse_args()
 
@@ -46,18 +46,22 @@ def main():
     args = parse_args()
     torch.manual_seed(0)
 
-    run = wandb.init(entity=args.entity, project=args.project, config={
-        "num_layer": args.num_layer,
-        "max_context_length": args.max_context_length,
-        "projection_dim": args.projection_dim,
-        "expansion_factor": args.expansion_factor,
-        "q_head": args.q_head,
-        "kv_head": args.kv_head,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay
-    })
+    # Use wandb if applicable
+    use_wandb = args.project is not None and args.entity is not None
+
+    if use_wandb:
+        run = wandb.init(entity=args.entity, project=args.project, config={
+            "num_layer": args.num_layer,
+            "max_context_length": args.max_context_length,
+            "projection_dim": args.projection_dim,
+            "expansion_factor": args.expansion_factor,
+            "q_head": args.q_head,
+            "kv_head": args.kv_head,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay
+        })
 
     train_loader, val_loader = prepare_dataset(args.train_path, args.val_path, args.batch_size, args.batch_size)
 
@@ -140,7 +144,8 @@ def main():
         val_losses.append(avg_val_loss)
 
         print(f"Epoch {epoch}: Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f}")
-        run.log({"Training Loss": train_losses[-1], "Val loss": val_losses[-1]})
+        if use_wandb:
+            run.log({"Training Loss": train_losses[-1], "Val loss": val_losses[-1]})
 
     plt.plot(train_losses, label="Training loss")
     plt.plot(val_losses, label="Validation loss")
@@ -149,7 +154,8 @@ def main():
     plt.legend()
     plt.show()
 
-    run.finish()
+    if use_wandb:
+        run.finish()
 
 if __name__ == "__main__":
     main()
