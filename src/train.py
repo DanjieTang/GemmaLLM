@@ -147,12 +147,13 @@ def main():
         if use_wandb:
             run.log({"Training Loss": train_losses[-1], "Val loss": val_losses[-1]})
 
-    plt.plot(train_losses, label="Training loss")
-    plt.plot(val_losses, label="Validation loss")
-    print("Training loss: ", train_losses[-1])
-    print("Validation loss: ", val_losses[-1])
-    plt.legend()
-    plt.show()
+    if not use_wandb:
+        plt.plot(train_losses, label="Training loss")
+        plt.plot(val_losses, label="Validation loss")
+        print("Training loss: ", train_losses[-1])
+        print("Validation loss: ", val_losses[-1])
+        plt.legend()
+        plt.show()
 
     if use_wandb:
         run.finish()
