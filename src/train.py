@@ -64,7 +64,7 @@ def main():
     model = VLM(
         num_layer=args.num_layer,
         max_context_length=args.max_context_length,
-        embeddings_path=args.embeddings_path,
+        word_embeddings_tensor=args.embeddings_path,
         projection_dim=args.projection_dim,
         expansion_factor=args.expansion_factor,
         use_moe=False,
