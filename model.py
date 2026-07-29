@@ -1,9 +1,13 @@
+import math
+from os import PathLike
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CLIPVisionModel, CLIPImageProcessor
-import math
 from PIL import Image
+from transformers import CLIPImageProcessor, CLIPVisionModel
+
 
 class ROPEEmbedding(nn.Module):
     def __init__(self, max_context_length: int, head_dim: int = 64, theta: int = 10000):
@@ -397,13 +401,17 @@ class VLM(nn.Module):
         model_id = "openai/clip-vit-large-patch14"
         self.vision_model = CLIPVisionModel.from_pretrained(model_id)
         self.vision_processor = CLIPImageProcessor.from_pretrained(model_id)
-        image_dim = 1024
-        self.visual_seq_len = 1# Vision sequence length
+        self.vision_model.requires_grad_(False)
+        self.vision_model.eval()
+        image_dim = self.vision_model.config.hidden_size
+        self.visual_seq_len = 1  # Use only CLIP's CLS token.
+        self.multimodal_prefix_len = self.visual_seq_len + 1
 
         # Load model token embeddings
-        self.word_embeddings_tensor = torch.load(word_embeddings_tensor)
-        zero_row = torch.zeros(1, self.word_embeddings_tensor.shape[1])
-        self.word_embeddings_tensor = torch.cat((self.word_embeddings_tensor, zero_row), dim=0).to(device)
+        word_embeddings = torch.load(word_embeddings_tensor, map_location="cpu")
+        zero_row = torch.zeros(1, word_embeddings.shape[1], dtype=word_embeddings.dtype)
+        word_embeddings = torch.cat((word_embeddings, zero_row), dim=0).to(device)
+        self.register_buffer("word_embeddings_tensor", word_embeddings, persistent=False)
         self.vocabulary_size, text_dim = self.word_embeddings_tensor.shape
         self.word_embeddings_tensor.requires_grad = False
 
@@ -430,9 +438,31 @@ class VLM(nn.Module):
                 self.image_token_projection = nn.Linear(image_dim, text_dim)
 
         # Create the LLM
-        self.llm = LLM(num_layer, self.vocabulary_size, max_context_length, projection_dim if projection_dim else text_dim, expansion_factor=expansion_factor, head_dim=head_dim, q_head=q_head, kv_head=kv_head, dropout_ratio=dropout_ratio, theta=theta, use_moe=use_moe, num_experts=num_experts, load_balancing_loss_weight=load_balancing_loss_weight, lora_rank=lora_rank, lora_alpha=lora_alpha, device=device)
+        self.llm = LLM(
+            num_layer,
+            self.vocabulary_size,
+            max_context_length + self.multimodal_prefix_len,
+            projection_dim if projection_dim else text_dim,
+            expansion_factor=expansion_factor,
+            head_dim=head_dim,
+            q_head=q_head,
+            kv_head=kv_head,
+            dropout_ratio=dropout_ratio,
+            theta=theta,
+            use_moe=use_moe,
+            num_experts=num_experts,
+            load_balancing_loss_weight=load_balancing_loss_weight,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            device=device,
+        )
         self.device = device
         self.fine_tuning = fine_tuning
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.vision_model.eval()
+        return self
 
     def begin_fine_tunning(self) -> None:
         self.fine_tuning = True
@@ -449,63 +479,136 @@ class VLM(nn.Module):
                 param.requires_grad = False
             else:
                 param.requires_grad = True
+        self.vision_model.requires_grad_(False)
 
-    def forward(self, token_ids: torch.Tensor, image_paths: list[str | None]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_images(
+        self,
+        image_paths: Sequence[str | PathLike[str]],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return one CLIP CLS token per image with shape [images, 1, dim]."""
+        images = []
+        for image_path in image_paths:
+            with Image.open(image_path) as image:
+                images.append(image.convert("RGB"))
+
+        try:
+            vision_inputs = self.vision_processor(
+                images=images,
+                return_tensors="pt",
+            ).to(device)
+        finally:
+            for image in images:
+                image.close()
+
+        with torch.no_grad():
+            outputs = self.vision_model(**vision_inputs)
+            # CLIP prepends its CLS token at sequence position zero.
+            image_tokens = outputs.last_hidden_state[:, :1, :]
+
+        if self.image_projection:
+            image_tokens = image_tokens.to(
+                self.image_token_projection.weight.dtype
+            )
+            image_tokens = self.image_token_projection(image_tokens)
+
+        return image_tokens.to(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        image_paths: Sequence[str | PathLike[str] | None],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, text_seq_len = token_ids.shape
-        pad_amount = self.visual_seq_len + 1
+        pad_amount = self.multimodal_prefix_len
         multimodal_seq_len = text_seq_len + pad_amount
-        assert batch_size == len(image_paths), "Mismatch between text and image inputs"
+        if batch_size != len(image_paths):
+            raise ValueError("Mismatch between text and image inputs")
 
-        # 1. Preallocate input data
-        multimodal_input_tensor = torch.empty(
-            (batch_size, multimodal_seq_len, self.llm.classifier.in_features), 
-            device=self.device, 
-            dtype=torch.float32
-        )
-        
-        # 2. Vectorized Text Embedding & Projection
+        # 1. Vectorized text embedding and projection.
         # input_embeddings.shape = [batch, seq_len, emb_dim]
         input_embeddings = self.word_embeddings_tensor[token_ids].float()
         if self.text_projection:
             input_embeddings = self.text_token_projection(input_embeddings)
-        
+
+        device = input_embeddings.device
+        multimodal_input_tensor = input_embeddings.new_empty(
+            batch_size,
+            multimodal_seq_len,
+            self.llm.classifier.in_features,
+        )
+
         # Place text embeddings into the right side of the pre-allocated tensor
         multimodal_input_tensor[:, pad_amount:, :] = input_embeddings
 
-        # 3. Collect images
-        has_image_mask = torch.tensor([p is not None for p in image_paths], device=self.device)
+        # 2. Fill the prefix with padding, then replace it for image samples.
+        has_image_mask = torch.tensor(
+            [path is not None for path in image_paths],
+            device=device,
+        )
         image_indices = torch.where(has_image_mask)[0]
 
-        # Prepare the padding embedding (for batches without images)
         pad_token_emb = self.word_embeddings_tensor[-1:].float()
         if self.text_projection:
             pad_token_emb = self.text_token_projection(pad_token_emb)
-        
-        # Fill the left side with padding by default
-        multimodal_input_tensor[:, :pad_amount, :] = pad_token_emb.repeat(batch_size, pad_amount, 1)
+
+        multimodal_input_tensor[:, :pad_amount, :] = pad_token_emb.expand(
+            batch_size,
+            pad_amount,
+            -1,
+        )
 
         if len(image_indices) > 0:
-            # Process only the actual images found
-            actual_images = [Image.open(image_paths[i]).convert("RGB") for i in image_indices.tolist()]
-            vision_inputs = self.vision_processor(images=actual_images, return_tensors="pt").to(self.device)
-            
-            with torch.no_grad():
-                outputs = self.vision_model(**vision_inputs)
-                visual_tokens = outputs.last_hidden_state[:, 0:self.visual_seq_len, :]
-            
-            if self.image_projection:
-                visual_tokens = self.image_token_projection(visual_tokens)
-                
-            # Scatter visual tokens and separation tokens into the multimodal tensor
-            multimodal_input_tensor[image_indices, :self.visual_seq_len, :] = visual_tokens
-            multimodal_input_tensor[image_indices, self.visual_seq_len, :] = self.seperation_token
+            actual_image_paths = [
+                image_paths[index] for index in image_indices.tolist()
+            ]
+            image_tokens = self._encode_images(
+                actual_image_paths,
+                device=device,
+                dtype=multimodal_input_tensor.dtype,
+            )
+            multimodal_input_tensor[
+                image_indices,
+                :self.visual_seq_len,
+                :,
+            ] = image_tokens
+            multimodal_input_tensor[
+                image_indices,
+                self.visual_seq_len,
+                :,
+            ] = self.seperation_token
 
-        # 4. 3D Causal Mask
-        causal_mask = torch.triu(torch.ones(multimodal_seq_len, multimodal_seq_len) * float('-inf'), diagonal=1).to(self.device)
-        causal_mask.requires_grad = False
-        
-        # 5. Forward to LLM
-        tensor, load_balancing_loss = self.llm(multimodal_input_tensor, causal_mask, self.fine_tuning)
+        # 3. Text-only samples must not attend to the placeholder prefix used
+        # to keep mixed image/text batches rectangular.
+        causal_mask = torch.full(
+            (multimodal_seq_len, multimodal_seq_len),
+            float("-inf"),
+            device=device,
+            dtype=multimodal_input_tensor.dtype,
+        )
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        if not has_image_mask.all():
+            causal_mask = causal_mask[None, None, :, :].expand(
+                batch_size,
+                1,
+                -1,
+                -1,
+            ).clone()
+            causal_mask[
+                ~has_image_mask,
+                0,
+                pad_amount:,
+                :pad_amount,
+            ] = float("-inf")
+
+        # 4. Forward through the language model and discard prefix predictions.
+        tensor, load_balancing_loss = self.llm(
+            multimodal_input_tensor,
+            causal_mask,
+            self.fine_tuning,
+        )
         tensor = tensor[:, pad_amount:, :]
         tensor = tensor.contiguous()
     

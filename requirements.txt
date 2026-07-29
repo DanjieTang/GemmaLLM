@@ -4,3 +4,5 @@ datasets
 matplotlib
 tqdm
 numpy
+pillow
+pytest

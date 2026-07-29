@@ -9,9 +9,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import argparse
 
-import wandb
-
 torch.manual_seed(0)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a VLM Model")
@@ -19,6 +18,8 @@ def parse_args():
     # Dataset & Paths
     parser.add_argument("--train_path", type=str, default="languages_tokenized_50_train.npy")
     parser.add_argument("--val_path", type=str, default="languages_tokenized_50_eval.npy")
+    parser.add_argument("--train_image_paths", type=str, default=None)
+    parser.add_argument("--val_image_paths", type=str, default=None)
     parser.add_argument("--embeddings_path", type=str, default="word_embeddings_tensor_llama3.pt")
     
     # Model Architecture
@@ -43,6 +44,15 @@ def parse_args():
     
     return parser.parse_args()
 
+
+def unpack_batch(batch):
+    if isinstance(batch, (tuple, list)):
+        data, image_paths = batch
+        return data, [path or None for path in image_paths]
+
+    return batch, [None] * batch.shape[0]
+
+
 def main():
     args = parse_args()
     torch.manual_seed(0)
@@ -51,6 +61,8 @@ def main():
     use_wandb = args.project is not None and args.entity is not None
 
     if use_wandb:
+        import wandb
+
         run = wandb.init(
             entity=args.entity,
             project=args.project,
@@ -69,7 +81,14 @@ def main():
             },
         )
 
-    train_loader, val_loader = prepare_dataset(args.train_path, args.val_path, args.batch_size, args.batch_size)
+    train_loader, val_loader = prepare_dataset(
+        args.train_path,
+        args.val_path,
+        args.batch_size,
+        args.batch_size,
+        args.train_image_paths,
+        args.val_image_paths,
+    )
 
     model = VLM(
         num_layer=args.num_layer,
@@ -102,13 +121,18 @@ def main():
         model.train()
         epoch_train_loss = []
 
-        for data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]"):
+        for batch in tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1}/{args.epochs} [Train]",
+        ):
+            data, image_paths = unpack_batch(batch)
+
             # Teacher forcing
             input_data = data[:, :-1].long().to(args.device)
             target_data = data[:, 1:].long().to(args.device)
 
             # Forward pass
-            prediction, load_balancing_loss = model(input_data, [None] * input_data.shape[0])
+            prediction, load_balancing_loss = model(input_data, image_paths)
 
             # Change shape for loss calculation
             prediction = prediction.view(-1, prediction.shape[-1])
@@ -130,13 +154,15 @@ def main():
         model.eval()
         epoch_val_loss = []
         with torch.no_grad():
-            for data in tqdm(val_loader, desc="Validating"):
+            for batch in tqdm(val_loader, desc="Validating"):
+                data, image_paths = unpack_batch(batch)
+
                 # Teacher forcing
                 input_data = data[:, :-1].long().to(args.device)
                 target_data = data[:, 1:].long().to(args.device)
 
                 # Forward pass
-                prediction, load_balancing_loss = model(input_data, [None] * input_data.shape[0])
+                prediction, load_balancing_loss = model(input_data, image_paths)
 
                 # Change shape for loss calculation
                 prediction = prediction.view(-1, prediction.shape[-1])
