@@ -197,7 +197,12 @@ class MOE(nn.Module):
         self.experts = nn.ModuleList([FeedForward(hidden_size, expansion_factor=expansion_factor, dropout_ratio=dropout_ratio, lora_rank=lora_rank, lora_alpha=lora_alpha) for _ in range(num_experts)])
         self.device = device
 
-    def forward(self, tensor: torch.Tensor, fine_tuning: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        tensor: torch.Tensor,
+        fine_tuning: bool = False,
+        valid_token_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Flatten for better manipulation, this is ok because tokens are independent at this stage
         batch_size, seq_len, hidden_size = tensor.shape
         flat_tensor = tensor.reshape(batch_size * seq_len, hidden_size)
@@ -210,9 +215,17 @@ class MOE(nn.Module):
         value_tensor, index_tensor = tensor.topk(k=2, dim=-1)
 
         # Find the load balancing loss
-        counts = torch.bincount(index_tensor[:, 0], minlength=self.num_experts)
-        frequencies = counts.float() / (batch_size * seq_len) # This is the hard one-hot frequency
-        probability = tensor.mean(0) # This is the soft probability
+        # Exclude trailing batch padding from routing statistics. The mask
+        # has shape [batch, seq_len] and does not change the attention mask.
+        routing_probabilities = tensor
+        first_experts = index_tensor[:, 0]
+        if valid_token_mask is not None:
+            valid_tokens = valid_token_mask.reshape(-1)
+            routing_probabilities = routing_probabilities[valid_tokens]
+            first_experts = first_experts[valid_tokens]
+        counts = torch.bincount(first_experts, minlength=self.num_experts)
+        frequencies = counts.float() / routing_probabilities.shape[0]
+        probability = routing_probabilities.mean(0)
         load_balancing_loss = (probability * frequencies).mean() * float(self.num_experts ** 2)
 
         # Normalize top1 and top2 score
@@ -302,7 +315,13 @@ class LLMLayer(nn.Module):
             self.ffn = FeedForward(hidden_dim, expansion_factor=expansion_factor, dropout_ratio=dropout_ratio, lora_rank=lora_rank, lora_alpha=lora_alpha)
         self.device = device
 
-    def forward(self, tensor: torch.Tensor, attention_mask: torch.Tensor = None, fine_tuning: bool = False):
+    def forward(
+        self,
+        tensor: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        fine_tuning: bool = False,
+        valid_token_mask: torch.Tensor | None = None,
+    ):
         skip_connection = tensor
         tensor = self.norm1(tensor)
         tensor = self.mqa(tensor, attention_mask=attention_mask, fine_tuning=fine_tuning)
@@ -311,7 +330,9 @@ class LLMLayer(nn.Module):
         skip_connection = tensor
         tensor = self.norm2(tensor)
         if self.use_moe:
-            tensor, load_balancing_loss = self.moe(tensor, fine_tuning=fine_tuning)
+            tensor, load_balancing_loss = self.moe(
+                tensor, fine_tuning=fine_tuning, valid_token_mask=valid_token_mask
+            )
         else:
             tensor = self.ffn(tensor, fine_tuning=fine_tuning)
             load_balancing_loss = torch.tensor(0.0, dtype=tensor.dtype, device=self.device)# If not using MoE, load-balancing loss is zero
@@ -360,12 +381,23 @@ class LLM(nn.Module):
         self.classifier = nn.Linear(hidden_dim, vocabulary_size)
         self.device = device
 
-    def forward(self, tensor: torch.Tensor, causal_mask: torch.Tensor, fine_tuning: bool) -> torch.Tensor:
+    def forward(
+        self,
+        tensor: torch.Tensor,
+        causal_mask: torch.Tensor,
+        fine_tuning: bool,
+        valid_token_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Track load-balancing across layers (only if MoE is used)
         load_balancing_sum = torch.tensor(0.0, device=self.device)
 
         for layer in self.transformer:
-            tensor, load_balancing_loss = layer(tensor, attention_mask=causal_mask, fine_tuning=fine_tuning)
+            tensor, load_balancing_loss = layer(
+                tensor,
+                attention_mask=causal_mask,
+                fine_tuning=fine_tuning,
+                valid_token_mask=valid_token_mask,
+            )
             load_balancing_sum += load_balancing_loss
 
         load_balancing_loss = (load_balancing_sum / self.num_layer) * self.load_balancing_loss_weight
@@ -519,97 +551,69 @@ class VLM(nn.Module):
     def forward(
         self,
         token_ids: torch.Tensor,
-        image_paths: Sequence[str | PathLike[str] | None],
+        image_paths: Sequence[str | PathLike[str] | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, text_seq_len = token_ids.shape
-        pad_amount = self.multimodal_prefix_len
-        multimodal_seq_len = text_seq_len + pad_amount
+        if image_paths is None:
+            image_paths = [None] * batch_size
         if batch_size != len(image_paths):
             raise ValueError("Mismatch between text and image inputs")
 
-        # 1. Vectorized text embedding and projection.
-        # input_embeddings.shape = [batch, seq_len, emb_dim]
-        input_embeddings = self.word_embeddings_tensor[token_ids].float()
+        text_embeddings = self.word_embeddings_tensor[token_ids].float()
         if self.text_projection:
-            input_embeddings = self.text_token_projection(input_embeddings)
+            text_embeddings = self.text_token_projection(text_embeddings)
+        device = text_embeddings.device
+        image_indices = [
+            index for index, path in enumerate(image_paths) if path is not None
+        ]
 
-        device = input_embeddings.device
-        multimodal_input_tensor = input_embeddings.new_empty(
-            batch_size,
-            multimodal_seq_len,
-            self.llm.classifier.in_features,
-        )
-
-        # Place text embeddings into the right side of the pre-allocated tensor
-        multimodal_input_tensor[:, pad_amount:, :] = input_embeddings
-
-        # 2. Fill the prefix with padding, then replace it for image samples.
-        has_image_mask = torch.tensor(
-            [path is not None for path in image_paths],
-            device=device,
-        )
-        image_indices = torch.where(has_image_mask)[0]
-
-        pad_token_emb = self.word_embeddings_tensor[-1:].float()
-        if self.text_projection:
-            pad_token_emb = self.text_token_projection(pad_token_emb)
-
-        multimodal_input_tensor[:, :pad_amount, :] = pad_token_emb.expand(
-            batch_size,
-            pad_amount,
-            -1,
-        )
-
-        if len(image_indices) > 0:
-            actual_image_paths = [
-                image_paths[index] for index in image_indices.tolist()
-            ]
-            image_tokens = self._encode_images(
-                actual_image_paths,
-                device=device,
-                dtype=multimodal_input_tensor.dtype,
+        input_embeddings = text_embeddings
+        valid_token_mask = None
+        text_positions = torch.arange(text_seq_len, device=device)[None, :]
+        batch_indices = torch.arange(batch_size, device=device)[:, None]
+        if image_indices:
+            has_image = torch.tensor(
+                [path is not None for path in image_paths], device=device
             )
-            multimodal_input_tensor[
-                image_indices,
-                :self.visual_seq_len,
-                :,
-            ] = image_tokens
-            multimodal_input_tensor[
-                image_indices,
-                self.visual_seq_len,
-                :,
-            ] = self.seperation_token
+            offsets = has_image.long() * self.multimodal_prefix_len
+            text_positions = text_positions + offsets[:, None]
+            seq_len = text_seq_len + self.multimodal_prefix_len
+            input_embeddings = text_embeddings.new_zeros(
+                batch_size, seq_len, text_embeddings.shape[-1]
+            )
+            input_embeddings[batch_indices, text_positions] = text_embeddings
 
-        # 3. Text-only samples must not attend to the placeholder prefix used
-        # to keep mixed image/text batches rectangular.
+            image_tokens = self._encode_images(
+                [image_paths[index] for index in image_indices],
+                device=device,
+                dtype=text_embeddings.dtype,
+            )
+            input_embeddings[image_indices, :self.visual_seq_len] = image_tokens
+            input_embeddings[image_indices, self.visual_seq_len] = (
+                self.seperation_token.to(text_embeddings.dtype)
+            )
+            if len(image_indices) != batch_size:
+                valid_token_mask = torch.arange(seq_len, device=device)[None, :] < (
+                    text_seq_len + offsets[:, None]
+                )
+
+        # Padding is strictly after the text, so the shared causal mask
+        # already prevents every real token from attending to padding.
+        seq_len = input_embeddings.shape[1]
         causal_mask = torch.full(
-            (multimodal_seq_len, multimodal_seq_len),
+            (seq_len, seq_len),
             float("-inf"),
             device=device,
-            dtype=multimodal_input_tensor.dtype,
-        )
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-        if not has_image_mask.all():
-            causal_mask = causal_mask[None, None, :, :].expand(
-                batch_size,
-                1,
-                -1,
-                -1,
-            ).clone()
-            causal_mask[
-                ~has_image_mask,
-                0,
-                pad_amount:,
-                :pad_amount,
-            ] = float("-inf")
-
-        # 4. Forward through the language model and discard prefix predictions.
-        tensor, load_balancing_loss = self.llm(
-            multimodal_input_tensor,
+            dtype=input_embeddings.dtype,
+        ).triu(diagonal=1)
+        logits, load_balancing_loss = self.llm(
+            input_embeddings,
             causal_mask,
             self.fine_tuning,
+            valid_token_mask=valid_token_mask,
         )
-        tensor = tensor[:, pad_amount:, :]
-        tensor = tensor.contiguous()
-    
-        return tensor, load_balancing_loss
+        if image_indices:
+            # Select text predictions at offset 2 for image samples and 0
+            # for text-only samples, preserving batch order and gradients.
+            logits = logits[batch_indices, text_positions]
+        return logits.contiguous(), load_balancing_loss
