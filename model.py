@@ -426,13 +426,13 @@ class VLM(nn.Module):
                  fine_tuning: bool = False,
                  lora_rank: int = 16,
                  lora_alpha: int = 32,
-                 device: str = "mps"):
+                 device: str = "cuda",
+                 clip_model_id: str = "openai/clip-vit-large-patch14"):
         super().__init__()
 
-        # Right now this code is hard coded to use CLIP ViT
-        model_id = "openai/clip-vit-large-patch14"
-        self.vision_model = CLIPVisionModel.from_pretrained(model_id)
-        self.vision_processor = CLIPImageProcessor.from_pretrained(model_id)
+        self.max_context_length = max_context_length
+        self.vision_model = CLIPVisionModel.from_pretrained(clip_model_id)
+        self.vision_processor = CLIPImageProcessor.from_pretrained(clip_model_id)
         self.vision_model.requires_grad_(False)
         self.vision_model.eval()
         image_dim = self.vision_model.config.hidden_size
@@ -440,9 +440,11 @@ class VLM(nn.Module):
         self.multimodal_prefix_len = self.visual_seq_len + 1
 
         # Load model token embeddings
-        word_embeddings = torch.load(word_embeddings_tensor, map_location="cpu")
-        zero_row = torch.zeros(1, word_embeddings.shape[1], dtype=word_embeddings.dtype)
-        word_embeddings = torch.cat((word_embeddings, zero_row), dim=0).to(device)
+        word_embeddings = torch.load(word_embeddings_tensor, map_location="cpu",
+                                     weights_only=True, mmap=True)
+        if not isinstance(word_embeddings, torch.Tensor) or word_embeddings.ndim != 2:
+            raise ValueError("Expected a 2D token embedding tensor.")
+        word_embeddings = word_embeddings.to(device)
         self.register_buffer("word_embeddings_tensor", word_embeddings, persistent=False)
         self.vocabulary_size, text_dim = self.word_embeddings_tensor.shape
         self.word_embeddings_tensor.requires_grad = False
@@ -552,10 +554,24 @@ class VLM(nn.Module):
         self,
         token_ids: torch.Tensor,
         image_paths: Sequence[str | PathLike[str] | None] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        image_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict next text tokens; attention_mask marks right-padded text inputs.
+
+        image_tokens optionally supplies projected CLIP tokens [batch, 1, hidden]
+        so generation can reuse the encoder output across decoding steps.
+        """
         batch_size, text_seq_len = token_ids.shape
+        if not 0 < text_seq_len <= self.max_context_length:
+            raise ValueError("Text input length must be within max_context_length.")
+        if token_ids.min() < 0 or token_ids.max() >= self.vocabulary_size:
+            raise ValueError("Token ID outside the embedding vocabulary.")
+        if image_tokens is not None and image_paths is not None:
+            raise ValueError("Supply image_paths or cached image_tokens, not both.")
         if image_paths is None:
             image_paths = [None] * batch_size
+        image_paths = [path or None for path in image_paths]
         if batch_size != len(image_paths):
             raise ValueError("Mismatch between text and image inputs")
 
@@ -563,17 +579,27 @@ class VLM(nn.Module):
         if self.text_projection:
             text_embeddings = self.text_token_projection(text_embeddings)
         device = text_embeddings.device
-        image_indices = [
+        image_indices = list(range(batch_size)) if image_tokens is not None else [
             index for index, path in enumerate(image_paths) if path is not None
         ]
 
         input_embeddings = text_embeddings
-        valid_token_mask = None
+        if attention_mask is None:
+            attention_mask = torch.ones_like(token_ids, dtype=torch.bool)
+        else:
+            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+            if attention_mask.shape != token_ids.shape:
+                raise ValueError("attention_mask must match token_ids.")
+            if not attention_mask[:, 0].all() or (
+                attention_mask[:, 1:] & ~attention_mask[:, :-1]
+            ).any():
+                raise ValueError("Only nonempty, right-padded text inputs are supported.")
+        valid_token_mask = attention_mask
         text_positions = torch.arange(text_seq_len, device=device)[None, :]
         batch_indices = torch.arange(batch_size, device=device)[:, None]
         if image_indices:
             has_image = torch.tensor(
-                [path is not None for path in image_paths], device=device
+                [index in image_indices for index in range(batch_size)], device=device
             )
             offsets = has_image.long() * self.multimodal_prefix_len
             text_positions = text_positions + offsets[:, None]
@@ -583,19 +609,22 @@ class VLM(nn.Module):
             )
             input_embeddings[batch_indices, text_positions] = text_embeddings
 
-            image_tokens = self._encode_images(
-                [image_paths[index] for index in image_indices],
-                device=device,
-                dtype=text_embeddings.dtype,
-            )
+            if image_tokens is None:
+                image_tokens = self._encode_images(
+                    [image_paths[index] for index in image_indices],
+                    device=device,
+                    dtype=text_embeddings.dtype,
+                )
+            if image_tokens.shape != (len(image_indices), 1, text_embeddings.shape[-1]):
+                raise ValueError("Cached image tokens have an incompatible shape.")
             input_embeddings[image_indices, :self.visual_seq_len] = image_tokens
             input_embeddings[image_indices, self.visual_seq_len] = (
                 self.seperation_token.to(text_embeddings.dtype)
             )
-            if len(image_indices) != batch_size:
-                valid_token_mask = torch.arange(seq_len, device=device)[None, :] < (
-                    text_seq_len + offsets[:, None]
-                )
+            valid_token_mask = torch.zeros(batch_size, seq_len, device=device,
+                                          dtype=torch.bool)
+            valid_token_mask[batch_indices, text_positions] = attention_mask
+            valid_token_mask[image_indices, :self.multimodal_prefix_len] = True
 
         # Padding is strictly after the text, so the shared causal mask
         # already prevents every real token from attending to padding.
@@ -617,3 +646,41 @@ class VLM(nn.Module):
             # for text-only samples, preserving batch order and gradients.
             logits = logits[batch_indices, text_positions]
         return logits.contiguous(), load_balancing_loss
+
+    @torch.inference_mode()
+    def generate(self, image_path: str | PathLike[str], bos_token_id: int,
+                 eos_token_id: int, max_new_tokens: int = 256,
+                 temperature: float = 0.0, pad_token_id: int | None = None) -> list[int]:
+        """Generate one annotation, encoding the image once; no KV cache yet."""
+        if max_new_tokens < 1 or temperature < 0:
+            raise ValueError("max_new_tokens must be positive and temperature nonnegative.")
+        for token_id in (bos_token_id, eos_token_id, pad_token_id):
+            if token_id is not None and not 0 <= token_id < self.vocabulary_size:
+                raise ValueError("Special token ID outside the vocabulary.")
+        was_training = self.training
+        self.eval()
+        try:
+            device = self.word_embeddings_tensor.device
+            image_tokens = self._encode_images([image_path], device=device,
+                                               dtype=self.seperation_token.dtype)
+            tokens = torch.tensor([[bos_token_id]], device=device)
+            generated = []
+            for _ in range(min(max_new_tokens, self.max_context_length)):
+                logits, _ = self(tokens, image_tokens=image_tokens)
+                scores = logits[0, -1].clone()
+                for token_id in (bos_token_id, pad_token_id):
+                    if token_id is not None and token_id != eos_token_id:
+                        scores[token_id] = float("-inf")
+                if temperature == 0:
+                    next_token = scores.argmax().item()
+                else:
+                    next_token = torch.multinomial(
+                        (scores / temperature).softmax(-1), 1
+                    ).item()
+                if next_token == eos_token_id:
+                    break
+                generated.append(next_token)
+                tokens = torch.cat((tokens, tokens.new_tensor([[next_token]])), dim=1)
+            return generated
+        finally:
+            self.train(was_training)

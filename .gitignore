@@ -161,6 +161,10 @@ cython_debug/
 .DS_Store
 *.npy
 *.pt
+*.pt.tmp
+*.safetensors
+*.safetensors.part
+checkpoints/
 data/
 wandb/
 sweep_config.yaml

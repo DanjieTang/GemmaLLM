@@ -63,18 +63,31 @@ def save_input_ids(destination: Path, token_ids: list[int]) -> None:
 def tokenize_split(
     split: Path,
     tokenizer: PreTrainedTokenizerBase,
-    batch_size: int = 256,
+    batch_size: int = 1024,
     overwrite: bool = False,
 ) -> dict[str, int]:
     """Match images by relative stem and tokenize annotations in bounded batches."""
     annotations = annotation_directory(split)
     images = split / "images"
     output = split / "input_ids"
-    print(f"{split.name}: indexing image/annotation pairs...", flush=True)
     image_stems = {
         str(path.relative_to(images).with_suffix(""))
-        for path in iter_files(images, IMAGE_SUFFIXES)
+        for path in tqdm(
+            iter_files(images, IMAGE_SUFFIXES),
+            desc=f"{split.name}: indexing images", unit="image",
+            dynamic_ncols=True,
+        )
     }
+    # Count without retaining millions of annotation paths in memory.
+    annotation_count = sum(
+        1 for _ in tqdm(
+            iter_files(annotations, {".txt"}),
+            desc=f"{split.name}: counting annotations", unit="annotation",
+            dynamic_ncols=True,
+        )
+    )
+    if annotation_count == 0:
+        raise ValueError(f"{annotations}: no .txt annotations found.")
     annotation_paths = iter_files(annotations, {".txt"})
 
     stats = {"written": 0, "existing": 0, "missing_image": 0}
@@ -102,25 +115,33 @@ def tokenize_split(
         pending_texts.clear()
         pending_outputs.clear()
 
-    annotation_count = 0
-    for annotation in tqdm(annotation_paths, desc=split.name, unit="annotation"):
-        annotation_count += 1
-        relative = annotation.relative_to(annotations)
-        if str(relative.with_suffix("")) not in image_stems:
-            stats["missing_image"] += 1
-            continue
-        destination = output / relative.with_suffix(".npy")
-        if destination.exists() and not overwrite:
-            stats["existing"] += 1
-            continue
-        # Preserve whitespace and newlines; an empty file becomes [BOS, EOS].
-        pending_texts.append(annotation.read_text(encoding="utf-8"))
-        pending_outputs.append(destination)
-        if len(pending_texts) >= batch_size:
-            flush_batch()
-    flush_batch()
-    if annotation_count == 0:
-        raise ValueError(f"{annotations}: no .txt annotations found.")
+    with tqdm(
+        total=annotation_count, desc=f"{split.name}: tokenizing",
+        unit="annotation", dynamic_ncols=True,
+    ) as progress:
+        completed = 0
+        for annotation in annotation_paths:
+            relative = annotation.relative_to(annotations)
+            if str(relative.with_suffix("")) not in image_stems:
+                stats["missing_image"] += 1
+            else:
+                destination = output / relative.with_suffix(".npy")
+                if destination.exists() and not overwrite:
+                    stats["existing"] += 1
+                else:
+                    # Preserve whitespace; an empty file becomes [BOS, EOS].
+                    pending_texts.append(annotation.read_text(encoding="utf-8"))
+                    pending_outputs.append(destination)
+            completed += 1
+            if completed >= batch_size:
+                flush_batch()
+                progress.set_postfix(stats, refresh=False)
+                progress.update(completed)
+                completed = 0
+        # Include the final batch's writes before displaying 100% completion.
+        flush_batch()
+        progress.set_postfix(stats, refresh=False)
+        progress.update(completed)
     print(
         f"{split.name}: wrote {stats['written']:,}, "
         f"skipped {stats['existing']:,} existing, "
@@ -145,7 +166,7 @@ def main() -> None:
         "--folders", nargs="+",
         help="Dataset folder names to process (default: all paired datasets).",
     )
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument(
         "--overwrite", action="store_true",
         help="Regenerate existing arrays, e.g. after changing annotations/tokenizer.",
@@ -179,7 +200,8 @@ def main() -> None:
         f"BOS={tokenizer.bos_token_id}, EOS={tokenizer.eos_token_id}",
         flush=True,
     )
-    for split in splits:
+    for folder_index, split in enumerate(splits, start=1):
+        print(f"\nFolder {folder_index}/{len(splits)}: {split.name}", flush=True)
         tokenize_split(split, tokenizer, args.batch_size, args.overwrite)
 
 

@@ -13,13 +13,14 @@ class FakeVisionModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.config = type("Config", (), {"hidden_size": 4})()
+        self.scale = torch.nn.Parameter(torch.ones(()))
 
     def forward(self, pixel_values):
         batch_size = pixel_values.shape[0]
         cls_token = torch.tensor([1.0, 2.0, 3.0, 4.0])
         patch_token = torch.tensor([9.0, 9.0, 9.0, 9.0])
         hidden_state = torch.stack((cls_token, patch_token))
-        hidden_state = hidden_state.expand(batch_size, -1, -1).clone()
+        hidden_state = hidden_state.expand(batch_size, -1, -1).clone() * self.scale
         return type("Output", (), {"last_hidden_state": hidden_state})()
 
 
@@ -44,9 +45,10 @@ class CaptureLLM(torch.nn.Module):
         self.input_tensor = None
         self.attention_mask = None
 
-    def forward(self, tensor, causal_mask, fine_tuning):
+    def forward(self, tensor, causal_mask, fine_tuning, valid_token_mask=None):
         self.input_tensor = tensor.detach().clone()
         self.attention_mask = causal_mask.detach().clone()
+        self.valid_token_mask = valid_token_mask
         return tensor, torch.tensor(0.0)
 
 
@@ -97,11 +99,12 @@ class VLMTest(unittest.TestCase):
                     torch.tensor([1.0, 2.0, 3.0, 4.0]),
                 )
             )
-            self.assertTrue(
-                torch.isneginf(
-                    capture_llm.attention_mask[1, 0, 2:, :2]
-                ).all()
-            )
+            self.assertTrue(torch.isneginf(capture_llm.attention_mask[0, 1:]).all())
+            self.assertTrue(torch.equal(capture_llm.valid_token_mask,
+                                        torch.tensor([[1, 1, 1, 1, 1],
+                                                      [1, 1, 1, 0, 0]]).bool()))
+            torch.testing.assert_close(capture_llm.input_tensor[1, :3],
+                                       model.word_embeddings_tensor[token_ids[1]])
 
 
 if __name__ == "__main__":
