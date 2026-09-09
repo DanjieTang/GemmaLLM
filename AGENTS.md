@@ -8,28 +8,26 @@ Large generated artifacts (`*.npy`, `*.pt`, W&B runs, datasets, and sweep state)
 
 ## Setup, Training, and Development Commands
 
-Use a virtual environment and install the declared dependencies:
+Use uv to install the locked dependencies (including development tools):
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync --locked
 ```
 
 Run training with explicit local artifact paths:
 
 ```bash
-python train.py --train_path data/train.npy --val_path data/eval.npy \
+uv run python train.py --train_path data/train.npy --val_path data/eval.npy \
   --embeddings_path data/embeddings.pt --device cpu
 ```
 
 Preview a hyperparameter sweep without launching jobs:
 
 ```bash
-python run_sweep.py --config sweep_config.yaml --dry-run
+uv run python run_sweep.py --config sweep_config.yaml --dry-run
 ```
 
-Use `python -m compileall model.py train.py run_sweep.py` for a quick syntax check. W&B logging is enabled only when both `--project` and `--entity` are supplied; install `wandb` separately if needed.
+Use `uv run python -m compileall model.py train.py run_sweep.py` for a quick syntax check. Dependencies live in `pyproject.toml`; commit `uv.lock` after dependency changes. W&B logging is enabled only when both `--project` and `--entity` are supplied; install its optional dependency with `uv sync --locked --extra wandb` and run training with `uv run --extra wandb python train.py ...`.
 
 ## Coding Style & Naming Conventions
 

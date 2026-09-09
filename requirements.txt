@@ -1,8 +1,0 @@
-torch
-transformers
-datasets
-matplotlib
-tqdm
-numpy
-pillow
-pytest

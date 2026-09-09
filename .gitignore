@@ -161,6 +161,7 @@ cython_debug/
 .DS_Store
 *.npy
 *.pt
+data/
 wandb/
 sweep_config.yaml
 sweep_progress.json
