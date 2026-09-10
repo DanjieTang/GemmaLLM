@@ -4,11 +4,17 @@
 
 ## Training data.
 
-    a) All English Wikipedia pages(6.5 million).
+    a) All English Wikipedia 6.5 million pages(~2 billion tokens.).
 
-    b) ~2 billion tokens.
+    b) COCO 2017
 
-## Optimization around token generation
+    c) Open Images V7
+
+## Throughput optimizations
+
+    a) KV cache
+
+    b) MTP Speculative decoding
 
 Original speed = 28.09 tokens/s
 
