@@ -17,8 +17,21 @@ from train import parse_args
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_folder_lists_stay_together_and_scalar_lists_sweep():
-    config = parse_simple_yaml(ROOT / "sweep_config.yaml")
+@pytest.fixture
+def sweep_config(tmp_path):
+    # Keep sweep mechanics independent of the user's selected run settings.
+    path = tmp_path / "sweep.yaml"
+    path.write_text(
+        "data_root: data\ntrain_folders:\n  - train\n  - OpenImageV7_train\n"
+        "val_folders:\n  - val\n  - OpenImageV7_val\n"
+        "output_dir: checkpoints/annotation_sweep\nlr:\n  - 1e-3\n  - 3e-4\n"
+        "inference_every: 1000\ninference_max_new_tokens: 64\n"
+    )
+    return path
+
+
+def test_folder_lists_stay_together_and_scalar_lists_sweep(sweep_config):
+    config = parse_simple_yaml(sweep_config)
     multi_value = read_train_args(ROOT / "train.py", multi_value_only=True)
     keys, values = normalize_grid(config, multi_value)
     combinations = [dict(zip(keys, row)) for row in itertools.product(*values)]
@@ -35,16 +48,18 @@ def test_folder_lists_stay_together_and_scalar_lists_sweep():
         assert args.val_folders == ["val", "OpenImageV7_val"]
         assert args.data_root == "data"
         assert args.project is None
+        assert args.inference_every == 1000
+        assert args.inference_max_new_tokens == 64
     assert len(directories) == 2
 
 
-def test_sweep_dry_run_preserves_state_and_emits_usable_commands(tmp_path):
+def test_sweep_dry_run_preserves_state_and_emits_usable_commands(tmp_path, sweep_config):
     state = tmp_path / "state.json"
     state.write_text('{"completed": {}, "failed": {}, "in_progress": null}')
     before = state.read_bytes()
     result = subprocess.run(
         [sys.executable, str(ROOT / "run_sweep.py"),
-         "--config", str(ROOT / "sweep_config.yaml"),
+         "--config", str(sweep_config),
          "--state-file", str(state), "--dry-run"],
         cwd=ROOT, check=True, capture_output=True, text=True,
     )
@@ -54,6 +69,8 @@ def test_sweep_dry_run_preserves_state_and_emits_usable_commands(tmp_path):
     parsed = [parse_args(command[2:]) for command in commands]
     assert parsed[0].output_dir != parsed[1].output_dir
     assert all(args.output_dir.parent == Path("checkpoints/annotation_sweep")
+               for args in parsed)
+    assert all(args.inference_every == 1000 and args.inference_max_new_tokens == 64
                for args in parsed)
     assert state.read_bytes() == before
     assert not (tmp_path / "checkpoints").exists()
@@ -70,6 +87,17 @@ def test_command_preserves_paths_with_spaces():
 def test_empty_folder_list_rejected():
     with pytest.raises(ValueError, match="empty list"):
         normalize_grid(OrderedDict(train_folders=[]), {"train_folders"})
+
+
+def test_inference_interval_can_be_swept_or_disabled():
+    config = OrderedDict(inference_every=[0, 1000, 2000])
+    assert set(config) <= read_train_args(ROOT / "train.py")
+    keys, values = normalize_grid(config)
+    intervals = []
+    for row in itertools.product(*values):
+        cmd = build_command(sys.executable, ROOT / "train.py", dict(zip(keys, row)), "test")
+        intervals.append(parse_args(cmd[2:]).inference_every)
+    assert intervals == [0, 1000, 2000]
 
 
 def test_boolean_model_options_sweep_independently(tmp_path):

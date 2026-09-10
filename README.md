@@ -11,6 +11,7 @@
 ## Optimization around token generation
 
 Original speed = 28.09 tokens/s
+
 Latest speed = 153.82 tokens/s
 
 ## Key insights from this implementation.

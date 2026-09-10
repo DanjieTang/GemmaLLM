@@ -33,7 +33,7 @@ lora_alpha: 32
 
 # Training Hyperparameters
 epochs: 10
-batch_size: 24
+batch_size: 16
 
 # Generate and print one validation image annotation every N training iterations.
 # Iterations accumulate across epochs; 0 disables previews.
