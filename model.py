@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from os import PathLike
 from typing import Sequence
 
@@ -7,6 +8,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPImageProcessor, CLIPVisionModel
+
+
+# Each layer stores rotated keys and values as [batch, kv_heads, sequence, head_dim].
+KVCache = tuple[torch.Tensor, torch.Tensor]
+PastKeyValues = tuple[KVCache, ...]
+
+
+@dataclass(frozen=True)
+class VLMCache:
+    """Decoder KV tensors and text length, excluding the optional image prefix."""
+
+    past_key_values: PastKeyValues
+    text_length: int
 
 
 class ROPEEmbedding(nn.Module):
@@ -47,11 +61,13 @@ class ROPEEmbedding(nn.Module):
         # tensor = tensor.reshape(original_shape) 
         return tensor
 
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, tensor: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
         sequence_length = tensor.shape[2] # Assuming we are using batch_size, head, sequence_length and dim
+        if position_offset < 0 or position_offset + sequence_length > self.pos_emb.shape[0]: # Check to see the embedding we're rotating fits into max_context_length after image offset(if present)
+            raise ValueError("Sequence including cached tokens exceeds the RoPE context length.")
 
         tensor = torch.cat((tensor, self.flip_for_sin(tensor)), dim=-1)
-        tensor = tensor * self.pos_emb[:sequence_length, :]
+        tensor = tensor * self.pos_emb[position_offset:position_offset + sequence_length, :] # Image offset/KV cache if applicable.
         cos, sin = tensor.chunk(chunks=2, dim=-1)
         tensor = cos + sin
         return tensor
@@ -93,7 +109,14 @@ class Attention(nn.Module):
         # Each gate gets one gate score as recommended in the paper
         self.gate = nn.Linear(hidden_dim, q_head)
 
-    def forward(self, tensor: torch.Tensor, attention_mask: torch.Tensor = None, fine_tuning: bool = False) -> torch.Tensor:
+    def forward(
+        self,
+        tensor: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        fine_tuning: bool = False,
+        past_key_value: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
         batch_size, seq_len, hid_dim = tensor.shape
         pre_norm_tensor = tensor # Used to calculate gate score
 
@@ -109,19 +132,39 @@ class Attention(nn.Module):
         key = key.view(batch_size, seq_len, self.kv_head, self.head_dim)
         value = value.view(batch_size, seq_len, self.kv_head, self.head_dim)
 
-        if self.multi_query_attention:
-            # If we are using multi query attention, duplicate key value heads
-            key = torch.repeat_interleave(key, self.q_kv_scale, dim=-2)
-            value = torch.repeat_interleave(value, self.q_kv_scale, dim=-2)
-
         # Switch to batch_size, head, seq_len, head_dim
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
+        past_length = 0
+        if past_key_value is not None:
+            if not use_cache:
+                raise ValueError("past_key_value requires use_cache=True.")
+            past_key, past_value = past_key_value
+            # Check past key and value tensor KV caches have the correct shape [batch_size, kv_head, sequence_length, head_dim]
+            if (len(past_key.shape) != 4 or past_key.shape != past_value.shape
+                    or past_key.shape[:2] != (batch_size, self.kv_head)
+                    or past_key.shape[-1] != self.head_dim):
+                raise ValueError("Cached keys and values have an incompatible shape.")
+            past_length = past_key.shape[2]
+
         # Apply ROPE
-        query = self.embedding(query)
-        key = self.embedding(key)
+        query = self.embedding(query, position_offset=past_length)
+        key = self.embedding(key, position_offset=past_length)
+        if past_key_value is not None:
+            # RoPE can promote keys to float32 under mixed-precision autocast.
+            if (past_key.device != key.device or past_value.device != value.device
+                    or past_key.dtype != key.dtype or past_value.dtype != value.dtype):
+                raise ValueError("Cached keys and values must match the current device and dtype.")
+            key = torch.cat((past_key, key), dim=2)
+            value = torch.cat((past_value, value), dim=2)
+        present_key_value = (key, value)
+
+        if self.multi_query_attention:
+            # Store only the original KV heads, expanding them for attention.
+            key = torch.repeat_interleave(key, self.q_kv_scale, dim=1)
+            value = torch.repeat_interleave(value, self.q_kv_scale, dim=1)
 
         # Classic self attention
         attention_raw = torch.matmul(query, key.transpose(2, 3))
@@ -149,6 +192,8 @@ class Attention(nn.Module):
             lora_tensor = lora_tensor * self.lora_scale
             output = lora_tensor + output
 
+        if use_cache:
+            return output, present_key_value
         return output
 
 class FeedForward(nn.Module):
@@ -321,10 +366,19 @@ class LLMLayer(nn.Module):
         attention_mask: torch.Tensor = None,
         fine_tuning: bool = False,
         valid_token_mask: torch.Tensor | None = None,
+        past_key_value: KVCache | None = None,
+        use_cache: bool = False,
     ):
         skip_connection = tensor
         tensor = self.norm1(tensor)
-        tensor = self.mqa(tensor, attention_mask=attention_mask, fine_tuning=fine_tuning)
+        attention_output = self.mqa(
+            tensor, attention_mask=attention_mask, fine_tuning=fine_tuning,
+            past_key_value=past_key_value, use_cache=use_cache,
+        )
+        if use_cache:
+            tensor, present_key_value = attention_output
+        else:
+            tensor = attention_output
         tensor += skip_connection
 
         skip_connection = tensor
@@ -339,6 +393,8 @@ class LLMLayer(nn.Module):
 
         tensor += skip_connection
 
+        if use_cache:
+            return tensor, load_balancing_loss, present_key_value
         return tensor, load_balancing_loss
 
 class LLM(nn.Module):
@@ -384,20 +440,62 @@ class LLM(nn.Module):
     def forward(
         self,
         tensor: torch.Tensor,
-        causal_mask: torch.Tensor,
-        fine_tuning: bool,
+        causal_mask: torch.Tensor | None = None,
+        fine_tuning: bool = False,
         valid_token_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        past_key_values: PastKeyValues | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, PastKeyValues]:
+        if past_key_values is not None and not use_cache:
+            raise ValueError("past_key_values requires use_cache=True.")
+        past_length = 0
+        if past_key_values is not None:
+            if len(past_key_values) != self.num_layer:
+                raise ValueError("past_key_values must contain one entry per layer.")
+            for key, value in past_key_values:
+                if len(key.shape) != 4 or key.shape != value.shape:
+                    raise ValueError("Cached keys and values must have matching 4D shapes.")
+            past_length = past_key_values[0][0].shape[2]
+            if any(key.shape[2] != past_length for key, _ in past_key_values): # Check every layer have same amount of cached token
+                raise ValueError("All layers must have the same cached sequence length.")
+        seq_len = tensor.shape[1]
+        total_length = past_length + seq_len
+        if seq_len < 1 or total_length > self.embedding.pos_emb.shape[0]:
+            raise ValueError("Sequence including cached tokens must be within max_context_length.")
+        if causal_mask is None:
+            # Example: past_length=2, seq_len=3 -> shape (3, 5), diagonal=3.
+            # Columns:  cached tokens | new tokens
+            #                 C0  C1  |  N0    N1    N2
+            # Row N0:          0   0  |   0  -inf  -inf
+            # Row N1:          0   0  |   0     0  -inf
+            # Row N2:          0   0  |   0     0     0
+            # 0 allows attention; -inf blocks attention to future tokens.
+            causal_mask = torch.full(
+                (seq_len, total_length), float("-inf"),
+                device=tensor.device, dtype=tensor.dtype,
+            ).triu(diagonal=past_length + 1)
+        elif causal_mask.shape[-2:] != (seq_len, total_length):
+            # For the example above, the supplied mask must end in shape (3, 5).
+            raise ValueError("causal_mask must end in [new_tokens, past + new_tokens].")
+
         # Track load-balancing across layers (only if MoE is used)
         load_balancing_sum = torch.tensor(0.0, device=self.device)
 
-        for layer in self.transformer:
-            tensor, load_balancing_loss = layer(
+        present_key_values = []
+        for index, layer in enumerate(self.transformer):
+            layer_output = layer(
                 tensor,
                 attention_mask=causal_mask,
                 fine_tuning=fine_tuning,
                 valid_token_mask=valid_token_mask,
+                past_key_value=None if past_key_values is None else past_key_values[index],
+                use_cache=use_cache,
             )
+            if use_cache:
+                tensor, load_balancing_loss, present_key_value = layer_output
+                present_key_values.append(present_key_value)
+            else:
+                tensor, load_balancing_loss = layer_output
             load_balancing_sum += load_balancing_loss
 
         load_balancing_loss = (load_balancing_sum / self.num_layer) * self.load_balancing_loss_weight
@@ -406,6 +504,8 @@ class LLM(nn.Module):
         tensor = self.output_norm(tensor)
         tensor = self.classifier(tensor)
 
+        if use_cache:
+            return tensor, load_balancing_loss, tuple(present_key_values)
         return tensor, load_balancing_loss
 
 class VLM(nn.Module):
@@ -556,15 +656,31 @@ class VLM(nn.Module):
         image_paths: Sequence[str | PathLike[str] | None] | None = None,
         attention_mask: torch.Tensor | None = None,
         image_tokens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        past_key_values: VLMCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, VLMCache]:
         """Predict next text tokens; attention_mask marks right-padded text inputs.
 
         image_tokens optionally supplies projected CLIP tokens [batch, 1, hidden]
         so generation can reuse the encoder output across decoding steps.
+
+        With use_cache=True, supply image_paths or image_tokens only on the
+        initial forward pass (one token or a full text prompt). Later passes
+        supply only new text tokens and past_key_values; the cache already
+        contains the image and separator keys/values.
         """
         batch_size, text_seq_len = token_ids.shape
-        if not 0 < text_seq_len <= self.max_context_length:
-            raise ValueError("Text input length must be within max_context_length.")
+        past_text_length = 0
+        if past_key_values is not None:
+            if not use_cache:
+                raise ValueError("past_key_values requires use_cache=True.")
+            if not isinstance(past_key_values, VLMCache):
+                raise ValueError("past_key_values must be a VLMCache returned by VLM.")
+            if image_paths is not None or image_tokens is not None:
+                raise ValueError("Supply image inputs only when initializing the KV cache.")
+            past_text_length = past_key_values.text_length
+        if text_seq_len < 1 or not 0 < past_text_length + text_seq_len <= self.max_context_length:
+            raise ValueError("Text length including cached tokens must be within max_context_length.")
         if token_ids.min() < 0 or token_ids.max() >= self.vocabulary_size:
             raise ValueError("Token ID outside the embedding vocabulary.")
         if image_tokens is not None and image_paths is not None:
@@ -584,6 +700,8 @@ class VLM(nn.Module):
         image_indices = list(range(batch_size)) if image_tokens is not None else [
             index for index, path in enumerate(image_paths) if path is not None
         ]
+        if use_cache and image_indices and len(image_indices) != batch_size:
+            raise ValueError("KV caching requires all samples to have images or all to be text-only.")
 
         input_embeddings = text_embeddings
         if attention_mask is None:
@@ -596,6 +714,8 @@ class VLM(nn.Module):
                 attention_mask[:, 1:] & ~attention_mask[:, :-1]
             ).any():
                 raise ValueError("Only nonempty, right-padded text inputs are supported.")
+        if use_cache and not attention_mask.all(): # Use KV cache only during inference, during autoregressive inference attention mask should be all true
+            raise ValueError("KV caching requires unpadded text inputs.")
         valid_token_mask = attention_mask
         text_positions = torch.arange(text_seq_len, device=device)[None, :]
         batch_indices = torch.arange(batch_size, device=device)[:, None]
@@ -619,7 +739,9 @@ class VLM(nn.Module):
                 )
             if image_tokens.shape != (len(image_indices), 1, text_embeddings.shape[-1]):  # Example: image_tokens.shape == (3, 1, 768)
                 raise ValueError("Cached image tokens have an incompatible shape.")
-            input_embeddings[image_indices, :self.visual_seq_len] = image_tokens
+            input_embeddings[image_indices, :self.visual_seq_len] = image_tokens.to(
+                device=device, dtype=text_embeddings.dtype,
+            )
             input_embeddings[image_indices, self.visual_seq_len] = (
                 self.seperation_token.to(text_embeddings.dtype)
             )
@@ -639,20 +761,36 @@ class VLM(nn.Module):
         # Padding is strictly after the text, so the shared causal mask
         # already prevents every real token from attending to padding.
         seq_len = input_embeddings.shape[1]
-        causal_mask = torch.full(
-            (seq_len, seq_len),
-            float("-inf"),
-            device=device,
-            dtype=input_embeddings.dtype,
-        ).triu(diagonal=1)
-        logits, load_balancing_loss = self.llm(
-            input_embeddings,
-            causal_mask,
-            self.fine_tuning,
-            valid_token_mask=valid_token_mask,
-        )
+        if use_cache:
+            # LLM derives the rectangular causal mask and RoPE offset from the
+            # cache length, which already includes the image and separator.
+            logits, load_balancing_loss, present_key_values = self.llm(
+                input_embeddings,
+                fine_tuning=self.fine_tuning,
+                valid_token_mask=valid_token_mask,
+                past_key_values=(None if past_key_values is None
+                                 else past_key_values.past_key_values),
+                use_cache=True,
+            )
+        else:
+            causal_mask = torch.full(
+                (seq_len, seq_len),
+                float("-inf"),
+                device=device,
+                dtype=input_embeddings.dtype,
+            ).triu(diagonal=1)
+            logits, load_balancing_loss = self.llm(
+                input_embeddings,
+                causal_mask,
+                self.fine_tuning,
+                valid_token_mask=valid_token_mask,
+            )
         if image_indices:
             # Select text predictions at offset 2 for image samples and 0
             # for text-only samples, preserving batch order and gradients.
             logits = logits[batch_indices, text_positions]
+        if use_cache:
+            return logits.contiguous(), load_balancing_loss, VLMCache(
+                present_key_values, past_text_length + text_seq_len,
+            )
         return logits.contiguous(), load_balancing_loss
