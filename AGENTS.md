@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Core PyTorch code lives at the repository root. `model.py` defines the transformer/VLM architecture, `train.py` is the main training entry point, `lazy_dataloader.py` memory-maps tokenized NumPy datasets, and `checkpoint.py` contains checkpoint helpers. `run_sweep.py` expands `sweep_config.yaml` into training runs and records progress in `sweep_progress.json`. Data preparation and fine-tuning experiments live in `data_preprocessing/` and `fine-tuning/`; old notebooks are retained under `deprecated/`.
+The `model/` package defines the transformer/VLM architecture, with separate modules for rotary embeddings, attention, feed-forward networks, mixture of experts, decoder layers, the LLM, the VLM, and cache types. Its `__init__.py` preserves imports such as `from model import LLM, VLM`. `train.py` is the main training entry point, `lazy_dataloader.py` memory-maps tokenized NumPy datasets, and `checkpoint.py` contains checkpoint helpers. `run_sweep.py` expands `sweep_config.yaml` into training runs and records progress in `sweep_progress.json`. Data preparation and fine-tuning experiments live in `data_preprocessing/` and `fine-tuning/`; old notebooks are retained under `deprecated/`.
 
 Large generated artifacts (`*.npy`, `*.pt`, W&B runs, datasets, and sweep state) are intentionally ignored. Do not commit model weights or local corpora.
 
@@ -27,7 +27,7 @@ Preview a hyperparameter sweep without launching jobs:
 uv run python run_sweep.py --config sweep_config.yaml --dry-run
 ```
 
-Use `uv run python -m compileall model.py train.py run_sweep.py` for a quick syntax check. Dependencies live in `pyproject.toml`; commit `uv.lock` after dependency changes. W&B logging is enabled only when both `--project` and `--entity` are supplied; install its optional dependency with `uv sync --locked --extra wandb` and run training with `uv run --extra wandb python train.py ...`.
+Use `uv run python -m compileall model train.py run_sweep.py` for a quick syntax check. Dependencies live in `pyproject.toml`; commit `uv.lock` after dependency changes. W&B logging is enabled only when both `--project` and `--entity` are supplied; install its optional dependency with `uv sync --locked --extra wandb` and run training with `uv run --extra wandb python train.py ...`.
 
 ## Coding Style & Naming Conventions
 

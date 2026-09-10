@@ -2,6 +2,25 @@
 
 # My implementation of the Gemma LLM.
 
+## Model structure
+
+The PyTorch architecture lives in the `model/` package:
+
+| File | Component |
+| --- | --- |
+| `rope.py` | `ROPEEmbedding`: rotary positional embeddings |
+| `attention.py` | `Attention`: gated attention, grouped KV heads, and LoRA |
+| `feed_forward.py` | `FeedForward`: gated feed-forward network and LoRA |
+| `moe.py` | `MOE`: expert routing and load-balancing loss |
+| `llm_layer.py` | `LLMLayer`: attention and feed-forward decoder block |
+| `llm.py` | `LLM`: decoder stack and vocabulary classifier |
+| `vlm.py` | `VLM`: CLIP image encoding and text/image fusion |
+| `cache.py` | `KVCache`, `PastKeyValues`, and `VLMCache`: shared cache types |
+
+Existing imports such as `from model import LLM, VLM` still work. Components
+can also be imported directly, for example `from model.attention import Attention`.
+The split preserves network behavior and checkpoint `state_dict` keys.
+
 ## Training data.
 
     a) All English Wikipedia 6.5 million pages(~2 billion tokens.).
