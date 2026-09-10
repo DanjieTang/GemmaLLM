@@ -1,7 +1,8 @@
 """Train the custom CLIP-conditioned annotation decoder or legacy token arrays."""
 
 import argparse
-from itertools import islice
+from collections.abc import Callable, Iterator
+from itertools import cycle, islice
 import math
 from pathlib import Path
 
@@ -11,7 +12,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from lazy_dataloader import prepare_annotation_dataset, prepare_dataset
+from generate import generate
+from lazy_dataloader import AnnotationDataset, prepare_annotation_dataset, prepare_dataset
 from model import VLM
 
 
@@ -69,6 +71,11 @@ def parse_args(argv: list[str] | None = None):
                         help="Limit pairs per train/validation dataset for smoke tests.")
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Limit batches per training/validation epoch for smoke tests.")
+    parser.add_argument("--inference_every", type=int, default=1000,
+                        help="Generate one validation image annotation every N training "
+                             "iterations across epochs; 0 disables previews.")
+    parser.add_argument("--inference_max_new_tokens", type=int, default=256,
+                        help="Maximum generated tokens per preview, capped by model context.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else
                         "mps" if torch.backends.mps.is_available() else "cpu")
     parser.add_argument("--project", default=None)
@@ -78,12 +85,14 @@ def parse_args(argv: list[str] | None = None):
     for name in ("epochs", "batch_size", "max_context_length", "num_layer",
                  "max_samples", "max_steps", "projection_dim", "q_head",
                  "kv_head", "head_dim", "expansion_factor", "theta",
-                 "num_experts", "lora_rank"):
+                 "num_experts", "lora_rank", "inference_max_new_tokens"):
         value = getattr(args, name)
         if value is not None and value < 1:
             parser.error(f"--{name} must be positive.")
     if args.num_workers < 0:
         parser.error("--num_workers cannot be negative.")
+    if args.inference_every < 0:
+        parser.error("--inference_every cannot be negative.")
     if not 0 <= args.dropout_ratio <= 1:
         parser.error("--dropout_ratio must be between 0 and 1.")
     if (not math.isfinite(args.load_balancing_loss_weight)
@@ -127,15 +136,41 @@ def prepare_batch(batch, device: str) -> dict:
             "attention_mask": None, "image_paths": images}
 
 
+def iter_validation_images(dataset) -> Iterator[str]:
+    """Read paired image paths without loading annotations; support legacy pairs too."""
+    if isinstance(dataset, AnnotationDataset):
+        for _, image_path in dataset.samples:
+            yield image_path
+    else:
+        for sample in dataset:
+            if isinstance(sample, (tuple, list)) and sample[1]:
+                yield sample[1]
+
+
+def print_image_inference(model: VLM, tokenizer, image_path: str, step: int,
+                          max_new_tokens: int) -> None:
+    """Decode from BOS and the image only; generate restores the training mode."""
+    tokens = generate(model, image_path, tokenizer.bos_token_id,
+                      tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
+                      max_new_tokens=max_new_tokens, temperature=0.0)
+    annotation = tokenizer.decode(tokens, skip_special_tokens=True)
+    with tqdm.external_write_mode():
+        print(f"\n[Inference | iteration {step}] Image: {image_path}\n"
+              f"Generated annotation: {annotation}", flush=True)
+
+
 def run_epoch(model, loader, device: str, optimizer=None, scheduler=None,
-              max_steps: int | None = None) -> float:
+              max_steps: int | None = None, *, start_step: int = 0,
+              inference_every: int = 0,
+              inference_callback: Callable[[int], None] | None = None) -> float:
     training = optimizer is not None
     model.train(training)
     total_loss, total_tokens = 0.0, 0
     limit = min(len(loader), max_steps) if max_steps else len(loader)
     with torch.set_grad_enabled(training):
-        for batch in tqdm(islice(loader, limit), total=limit,
-                          desc="Training" if training else "Validating"):
+        for step, batch in enumerate(tqdm(
+                islice(loader, limit), total=limit,
+                desc="Training" if training else "Validating"), start=start_step + 1):
             batch = prepare_batch(batch, device)
             labels = batch.pop("labels")
             if training:
@@ -152,6 +187,11 @@ def run_epoch(model, loader, device: str, optimizer=None, scheduler=None,
             count = (labels != -100).sum().item()
             total_loss += loss.item() * count
             total_tokens += count
+            # Release the batch logits before allocating the generation cache.
+            del logits, loss, auxiliary_loss
+            if (training and inference_every and step % inference_every == 0
+                    and inference_callback is not None):
+                inference_callback(step)
     if total_tokens == 0:
         raise ValueError("Dataset contains no target tokens.")
     return total_loss / total_tokens
@@ -214,6 +254,20 @@ def main():
             args.train_path, args.val_path, args.batch_size, args.batch_size,
             args.train_image_paths, args.val_image_paths,
         )
+    inference_callback = None
+    if args.inference_every:
+        if args.data_root or args.val_image_paths:
+            image_paths = cycle(iter_validation_images(val_loader.dataset))
+
+            def inference_callback(step: int) -> None:
+                image_path = next(image_paths, None)
+                if image_path is None:
+                    tqdm.write("Image inference skipped: no validation images available.")
+                    return
+                print_image_inference(model, tokenizer, image_path, step,
+                                      args.inference_max_new_tokens)
+        else:
+            print("Image inference disabled: legacy validation has no image manifest.")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=args.weight_decay)
@@ -232,9 +286,13 @@ def main():
         run = wandb.init(project=args.project, entity=args.entity, name=args.run_name,
                          config={key: str(value) if isinstance(value, Path) else value
                                  for key, value in vars(args).items()})
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(model, train_loader, args.device, optimizer, scheduler,
-                               args.max_steps)
+                               args.max_steps, start_step=global_step,
+                               inference_every=args.inference_every,
+                               inference_callback=inference_callback)
+        global_step += steps_per_epoch
         val_loss = run_epoch(model, val_loader, args.device, max_steps=args.max_steps)
         print(f"Epoch {epoch}: Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f}")
         output = args.output_dir / "latest.pt"

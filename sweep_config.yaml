@@ -12,11 +12,11 @@ clip_model_id: openai/clip-vit-large-patch14
 # Each combination gets its own subdirectory under output_dir.
 output_dir: checkpoints/annotation_sweep
 
-# Model Architecture
-num_layer: 3
+# Model Architecture (~200M trainable parameters)
+num_layer: 4
 max_context_length: 256
 projection_dim: 512
-expansion_factor: 16
+expansion_factor: 18
 head_dim: 64
 q_head: 8
 kv_head: 4
@@ -33,12 +33,15 @@ lora_alpha: 32
 
 # Training Hyperparameters
 epochs: 10
-batch_size: 4
+batch_size: 24
 
-# Scalar hyperparameter lists create separate sweep runs.
-lr:
-  - 1e-3
-  - 3e-4
+# Generate and print one validation image annotation every N training iterations.
+# Iterations accumulate across epochs; 0 disables previews.
+inference_every: 1000
+inference_max_new_tokens: 256
+
+# Fixed hyperparameters produce a single run.
+lr: 3e-4
 weight_decay: 1e-3
 
 # W&B is optional. Set both project and entity to enable it.
