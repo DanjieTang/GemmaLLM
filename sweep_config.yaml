@@ -1,0 +1,46 @@
+# Paired datasets; folder lists are combined within each run.
+data_root: data
+train_folders:
+  - train
+  - OpenImageV7_train
+val_folders:
+  - val
+  - OpenImageV7_val
+embeddings_path: data/gemma-4-31B-it-embeddings.pt
+clip_model_id: openai/clip-vit-large-patch14
+# tokenizer_path defaults to ~/models/gemma-4-E2B-it in train.py.
+# Each combination gets its own subdirectory under output_dir.
+output_dir: checkpoints/annotation_sweep
+
+# Model Architecture
+num_layer: 3
+max_context_length: 256
+projection_dim: 512
+expansion_factor: 16
+head_dim: 64
+q_head: 8
+kv_head: 4
+dropout_ratio: 0.1
+theta: 10000
+use_moe: false
+num_experts: 8
+load_balancing_loss_weight: 1e-2
+fine_tuning: false
+lora_rank: 16
+lora_alpha: 32
+# For LoRA training, set fine_tuning to true and supply a matching checkpoint.
+# init_checkpoint: checkpoints/pretrained/latest.pt
+
+# Training Hyperparameters
+epochs: 10
+batch_size: 4
+
+# Scalar hyperparameter lists create separate sweep runs.
+lr:
+  - 1e-3
+  - 3e-4
+weight_decay: 1e-3
+
+# W&B is optional. Set both project and entity to enable it.
+project: null
+entity: null

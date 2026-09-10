@@ -1,7 +1,10 @@
 import argparse
+import ast
+import hashlib
 import itertools
 import json
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -99,14 +102,32 @@ def parse_simple_yaml(path: Path) -> OrderedDict:
     return data
 
 
-def read_train_args(train_script: Path) -> set:
-    content = train_script.read_text(encoding="utf-8")
-    # Accept both single and double quotes in add_argument("--name")
-    names = re.findall(r'add_argument\(\s*[\'"]--([A-Za-z0-9_]+)[\'"]', content)
-    return set(names)
+def read_train_args(train_script: Path, multi_value_only: bool = False) -> set:
+    """Inspect argparse declarations without importing the training dependencies."""
+    tree = ast.parse(train_script.read_text(encoding="utf-8"))
+    names = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"):
+            continue
+        multi_value = any(
+            keyword.arg == "nargs" and isinstance(keyword.value, ast.Constant)
+            and (keyword.value.value in ("+", "*")
+                 or isinstance(keyword.value.value, int))
+            for keyword in node.keywords
+        )
+        if multi_value_only and not multi_value:
+            continue
+        for argument in node.args:
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                if argument.value.startswith("--"):
+                    names.add(argument.value[2:])
+    return names
 
 
-def normalize_grid(config: OrderedDict) -> Tuple[List[str], List[List]]:
+def normalize_grid(
+    config: OrderedDict, multi_value_args: set | None = None,
+) -> Tuple[List[str], List[List]]:
     keys = list(config.keys())
     value_lists = []
     for key in keys:
@@ -114,16 +135,19 @@ def normalize_grid(config: OrderedDict) -> Tuple[List[str], List[List]]:
         if isinstance(value, list):
             if len(value) == 0:
                 raise ValueError(f"Config key '{key}' has an empty list.")
-            value_lists.append(value)
+            value_lists.append([value] if key in (multi_value_args or ()) else value)
         else:
             value_lists.append([value])
     return keys, value_lists
 
 
-def get_varying_keys(config: OrderedDict) -> List[str]:
+def get_varying_keys(
+    config: OrderedDict, multi_value_args: set | None = None,
+) -> List[str]:
     varying_keys = []
     for key, value in config.items():
-        if isinstance(value, list) and len(value) > 1:
+        if (isinstance(value, list) and len(value) > 1
+                and key not in (multi_value_args or ())):
             varying_keys.append(key)
     return varying_keys
 
@@ -167,9 +191,18 @@ def build_command(
     for key, value in params.items():
         if value is None:
             continue
-        cmd.extend([f"--{key}", str(value)])
+        cmd.append(f"--{key}")
+        cmd.extend(str(item) for item in (value if isinstance(value, list) else [value]))
     cmd.extend(["--run_name", run_name])
     return cmd
+
+
+def checkpoint_directory(params: Dict, run_name: str) -> Path:
+    """Keep each combination's checkpoints separate, with stable rerun paths."""
+    base = Path(params.get("output_dir") or "checkpoints/sweeps").expanduser()
+    digest = hashlib.sha256(to_run_id(params).encode("utf-8")).hexdigest()[:12]
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_name).strip(".")[:80] or "run"
+    return base / f"{safe_name}-{digest}"
 
 
 def main():
@@ -192,8 +225,9 @@ def main():
             f"Allowed args: {sorted(valid_args)}"
         )
 
-    keys, value_lists = normalize_grid(config)
-    varying_keys = get_varying_keys(config)
+    multi_value_args = read_train_args(train_script, multi_value_only=True)
+    keys, value_lists = normalize_grid(config, multi_value_args)
+    varying_keys = get_varying_keys(config, multi_value_args)
     combos = [dict(zip(keys, values)) for values in itertools.product(*value_lists)]
 
     state = load_state(state_path)
@@ -221,8 +255,11 @@ def main():
             continue
 
         run_name = make_run_name(params, varying_keys)
-        cmd = build_command(args.python, train_script, params, run_name)
-        pretty_cmd = " ".join(cmd)
+        command_params = dict(params)
+        if "output_dir" in valid_args:
+            command_params["output_dir"] = str(checkpoint_directory(params, run_name))
+        cmd = build_command(args.python, train_script, command_params, run_name)
+        pretty_cmd = shlex.join(cmd)
         print(f"[{idx}/{total}] RUN: {params}")
         print(f"Run name: {run_name}")
         print(f"Command: {pretty_cmd}")

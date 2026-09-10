@@ -21,8 +21,8 @@ and PyPI on macOS. See the [uv PyTorch guide](https://docs.astral.sh/uv/guides/i
 if you need a different accelerator build.
 
 ```bash
-uv run python train.py --train_path data/train.npy --val_path data/eval.npy \
-  --embeddings_path data/embeddings.pt --device cpu
+uv run python train.py --data_root data --device cuda \
+  --output_dir checkpoints/annotations
 uv run python run_sweep.py --config sweep_config.yaml --dry-run
 ```
 
@@ -68,8 +68,10 @@ one image token. The model input is arranged as:
 
     [CLIP CLS] [learned separator] [text tokens]
 
-For multimodal training, pass `--train_image_paths` and
-`--val_image_paths` to `train.py`. Each file must be a one-dimensional
+For paired image annotations, `train.py` discovers files under `data/` by
+default; see the training instructions below. For legacy rectangular token
+arrays, pass `--train_path`, `--val_path`, `--train_image_paths`, and
+`--val_image_paths` to `train.py`. Each image-path file must be a one-dimensional
 NumPy string array with one image path per tokenized sample. Paths may be
 absolute or relative to the image-path array. Use an empty string for a
 text-only sample.
@@ -166,7 +168,8 @@ uv run python train.py --data_root data \
   --device cuda --output_dir checkpoints/annotations
 ```
 
-By default, `train` and `OpenImageV7_train` are combined for training; `val`
+Paired annotation training under `data/` is the default, even when
+`--data_root` is omitted. `train` and `OpenImageV7_train` are combined for training; `val`
 and `OpenImageV7_val` are combined for validation. Override these with
 `--train_folders train --val_folders val`, or provide several folder names
 after each flag. `--data_root` can point to any parent directory containing
@@ -207,7 +210,8 @@ Each epoch writes `OUTPUT_DIR/latest.pt` atomically, including the model,
 optimizer, scheduler, architecture, tokenizer path, and special-token IDs.
 Frozen CLIP weights are included; the large frozen token matrix stays in its
 external file and must remain available for inference. Use a distinct
-`--output_dir` for each experiment or sweep to preserve checkpoints. Losses
+`--output_dir` for each standalone experiment to preserve checkpoints. Sweeps
+automatically create a separate subdirectory for each combination. Losses
 are printed without opening an interactive plot; W&B remains optional.
 
 For a short end-to-end check before launching a full run:
@@ -225,7 +229,62 @@ uv run python train.py --data_root data \
 `--max_steps` limits batches in each training and validation epoch. A smoke-test
 checkpoint verifies execution only and will not produce useful annotations.
 Legacy rectangular `.npy` datasets and optional image-path manifests still work
-when `--data_root` is omitted; specify their matching tokenizer and embeddings.
+when both `--train_path` and `--val_path` are supplied; omit `--data_root` and
+specify their matching tokenizer and embeddings. Mixing paired and legacy
+dataset flags is rejected to avoid silently training on the wrong data.
+
+## Sweep annotation training
+
+`sweep_config.yaml` now uses all four paired dataset folders and the matching
+Gemma embeddings. Preview the commands, then launch them:
+
+```bash
+uv run python run_sweep.py --config sweep_config.yaml --dry-run
+uv run python run_sweep.py --config sweep_config.yaml
+```
+
+The YAML subset accepts scalar values and indented lists. `train_folders` and
+`val_folders` lists combine datasets within **every** run. Lists for scalar
+hyperparameters such as `lr` create separate runs; the supplied config tries
+`1e-3` and `3e-4`. Folder lists do not multiply the number of combinations.
+For a nested root, set `data_root: data/data` (or the actual split parent).
+
+All VLM constructor settings are exposed by `train.py` and accepted as sweep
+keys (`word_embeddings_tensor` uses the CLI name `embeddings_path`). This
+includes `dropout_ratio`, `theta`, `use_moe`, `num_experts`,
+`load_balancing_loss_weight`, `fine_tuning`, `lora_rank`, and `lora_alpha`.
+Their defaults match the model defaults. For example, replace the corresponding
+scalar entries in the supplied config with:
+
+```yaml
+use_moe:
+  - false
+  - true
+num_experts: 8
+dropout_ratio:
+  - 0.0
+  - 0.1
+```
+
+Boolean CLI options accept explicit values (`--use_moe false`) or a bare flag
+to enable them (`--use_moe`). MoE requires at least two experts. Model settings
+are saved in each checkpoint for inference. KV caching remains disabled during
+training.
+
+For LoRA training, set `fine_tuning: true` and
+`init_checkpoint: checkpoints/pretrained/latest.pt`. Use the checkpoint's
+architecture settings, including LoRA rank, and the same tokenizer and embedding
+artifacts. This loads model weights and trains only LoRA parameters; optimizer,
+scheduler, and epoch counters start fresh. Without `init_checkpoint`, the
+decoder starts from random weights even when `fine_tuning` is enabled.
+
+In a sweep, `output_dir` is a base directory. Each combination writes
+`output_dir/<run-name>-<parameter-hash>/latest.pt`, so later runs cannot overwrite
+earlier combinations. Pass that checkpoint path to `generate.py`. A rerun of
+the same parameters reuses the same directory. Completed combinations are
+skipped using `sweep_progress.json`; `--force-rerun` retrains them from scratch.
+W&B is disabled in the supplied config; set both `project` and `entity` and run
+with `uv run --extra wandb` to enable it.
 
 ## Generate an annotation
 
@@ -239,9 +298,27 @@ Inference restores the architecture from the checkpoint, encodes the image once,
 and autoregressively predicts from BOS until EOS, the requested token limit, or
 the trained context limit. Greedy decoding is the default; `--temperature 0.7`
 enables sampling. BOS and PAD are suppressed during generation. The decoder
-currently recomputes the text prefix on each step (no KV cache). Use
+caches the image prefix and text keys/values, processing only the new text token
+after the first step. Use
 `--embeddings_path` and `--tokenizer_path` if the artifacts have moved. The
 original tokenizer mapping must be preserved.
+
+For direct VLM calls, enable caching with `use_cache=True`:
+
+```python
+model.eval()
+with torch.inference_mode():
+    logits, aux_loss, cache = model(prompt_ids, image_paths=[image_path], use_cache=True)
+    next_ids = logits[:, -1:].argmax(dim=-1)
+    logits, aux_loss, cache = model(next_ids, past_key_values=cache, use_cache=True)
+```
+
+Supply images only on the initial call and only new text tokens when reusing the
+returned `VLMCache`. Caching supports unpadded batches with images for every sample
+or text-only batches. Mixed image/text and padded batches use the default uncached
+forward, which still returns `(logits, aux_loss)`. The text context limit includes
+cached text tokens and excludes the image and separator. The Python `generate()`
+helper accepts `use_cache=False` to compare against full-prefix decoding.
 
 ## Validation
 

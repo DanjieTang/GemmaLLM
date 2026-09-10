@@ -7,10 +7,33 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from generate import generate
 from lazy_dataloader import AnnotationDataset, collate_annotations, prepare_annotation_dataset
 from model import VLM
-from train import run_epoch, save_training_checkpoint
+from train import parse_args, run_epoch, save_training_checkpoint
 from test_vlm import FakeVisionModel, FakeVisionProcessor
+
+
+def test_training_defaults_to_paired_data_and_accepts_explicit_legacy_paths():
+    assert parse_args([]).data_root == "data"
+    assert parse_args(["--data_root", "data/data"]).data_root == "data/data"
+    args = parse_args(["--train_path", "train.npy", "--val_path", "val.npy"])
+    assert args.data_root is None
+    assert args.train_path == "train.npy"
+
+
+@pytest.mark.parametrize("flags", [
+    ["--train_path", "train.npy"],
+    ["--val_path", "val.npy"],
+    ["--data_root", "data", "--train_path", "train.npy", "--val_path", "val.npy"],
+    ["--train_image_paths", "images.npy"],
+    ["--q_head", "0"],
+    ["--kv_head", "0"],
+    ["--head_dim", "0"],
+])
+def test_invalid_training_options_fail_before_loading_model(flags):
+    with pytest.raises(SystemExit):
+        parse_args(flags)
 
 
 def make_pair(root, name, ids, annotation_folder="annotations"):
@@ -104,15 +127,20 @@ def test_causal_text_predictions_do_not_see_future(tmp_path):
     torch.testing.assert_close(first[:, :2], second[:, :2])
 
 
-def test_generation_encodes_once_and_stops_at_eos(tmp_path):
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_generation_encodes_once_and_stops_at_eos(tmp_path, use_cache):
     model, _ = tiny_model(tmp_path)
     with patch.object(model, "_encode_images", return_value=torch.zeros(1, 1, 4)) as encode:
+        next_ids = iter([4, 1])
         def next_logits(token_ids, **kwargs):
             logits = torch.full((1, token_ids.shape[1], 16), -100.0)
-            logits[0, -1, 4 if token_ids.shape[1] == 1 else 1] = 100
+            logits[0, -1, next(next_ids)] = 100
+            if kwargs.get("use_cache"):
+                return logits, torch.tensor(0.0), object()
             return logits, torch.tensor(0.0)
         with patch.object(model, "forward", side_effect=next_logits) as forward:
-            assert model.generate("image.png", 2, 1, pad_token_id=0) == [4]
+            assert generate(model, "image.png", 2, 1, pad_token_id=0,
+                            use_cache=use_cache) == [4]
             assert forward.call_count == 2
         encode.assert_called_once()
     assert model.training

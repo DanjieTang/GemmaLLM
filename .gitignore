@@ -167,7 +167,6 @@ cython_debug/
 checkpoints/
 data/
 wandb/
-sweep_config.yaml
 sweep_progress.json
 experimental/
 coco2017/

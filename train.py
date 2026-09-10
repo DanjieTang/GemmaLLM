@@ -15,15 +15,26 @@ from lazy_dataloader import prepare_annotation_dataset, prepare_dataset
 from model import VLM
 
 
-def parse_args():
+def parse_bool(value: str) -> bool:
+    """Accept explicit boolean values from sweep commands and the CLI."""
+    if value.lower() in {"true", "1", "yes"}:
+        return True
+    if value.lower() in {"false", "0", "no"}:
+        return False
+    raise argparse.ArgumentTypeError("Expected true or false.")
+
+
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_root", type=str, default=None,
-                        help="Enable paired-file training under this directory.")
+                        help="Parent of paired dataset folders (default: data).")
     parser.add_argument("--train_folders", nargs="+", default=["train", "OpenImageV7_train"])
     parser.add_argument("--val_folders", nargs="+", default=["val", "OpenImageV7_val"])
     parser.add_argument("--tokenizer_path", default=str(Path.home() / "models/gemma-4-E2B-it"))
-    parser.add_argument("--train_path", default="languages_tokenized_50_train.npy")
-    parser.add_argument("--val_path", default="languages_tokenized_50_eval.npy")
+    parser.add_argument("--train_path", default=None,
+                        help="Legacy rectangular token array; requires --val_path.")
+    parser.add_argument("--val_path", default=None,
+                        help="Legacy validation array; requires --train_path.")
     parser.add_argument("--train_image_paths", default=None)
     parser.add_argument("--val_image_paths", default=None)
     parser.add_argument("--embeddings_path", default="data/gemma-4-31B-it-embeddings.pt")
@@ -36,6 +47,19 @@ def parse_args():
     parser.add_argument("--head_dim", type=int, default=64)
     parser.add_argument("--q_head", type=int, default=8)
     parser.add_argument("--kv_head", type=int, default=4)
+    parser.add_argument("--dropout_ratio", type=float, default=0.1)
+    parser.add_argument("--theta", type=int, default=10000,
+                        help="Base used for rotary position embeddings.")
+    parser.add_argument("--use_moe", type=parse_bool, nargs="?", const=True,
+                        default=False, help="Enable MoE; accepts true/false.")
+    parser.add_argument("--num_experts", type=int, default=8)
+    parser.add_argument("--load_balancing_loss_weight", type=float, default=1e-2)
+    parser.add_argument("--fine_tuning", type=parse_bool, nargs="?", const=True,
+                        default=False, help="Train only LoRA parameters; accepts true/false.")
+    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--init_checkpoint", type=Path, default=None,
+                        help="Load model weights before training (matching architecture required).")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -50,19 +74,37 @@ def parse_args():
     parser.add_argument("--project", default=None)
     parser.add_argument("--entity", default=None)
     parser.add_argument("--run_name", default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     for name in ("epochs", "batch_size", "max_context_length", "num_layer",
-                 "max_samples", "max_steps"):
+                 "max_samples", "max_steps", "projection_dim", "q_head",
+                 "kv_head", "head_dim", "expansion_factor", "theta",
+                 "num_experts", "lora_rank"):
         value = getattr(args, name)
         if value is not None and value < 1:
             parser.error(f"--{name} must be positive.")
     if args.num_workers < 0:
         parser.error("--num_workers cannot be negative.")
+    if not 0 <= args.dropout_ratio <= 1:
+        parser.error("--dropout_ratio must be between 0 and 1.")
+    if (not math.isfinite(args.load_balancing_loss_weight)
+            or args.load_balancing_loss_weight < 0):
+        parser.error("--load_balancing_loss_weight must be finite and nonnegative.")
+    if args.lora_alpha < 0:
+        parser.error("--lora_alpha cannot be negative.")
+    if args.use_moe and args.num_experts < 2:
+        parser.error("--use_moe requires at least two experts for top-2 routing.")
     if args.projection_dim != args.q_head * args.head_dim:
         parser.error("projection_dim must equal q_head * head_dim.")
     if args.kv_head < 1 or args.q_head % args.kv_head or args.head_dim % 2:
         parser.error("q_head must be divisible by kv_head and head_dim must be even.")
-    if args.data_root and (args.train_image_paths or args.val_image_paths):
+    legacy = args.train_path is not None or args.val_path is not None
+    if legacy and (args.train_path is None or args.val_path is None):
+        parser.error("Legacy training requires both --train_path and --val_path.")
+    if legacy and args.data_root is not None:
+        parser.error("Choose --data_root or legacy --train_path/--val_path.")
+    if not legacy and args.data_root is None:
+        args.data_root = "data"
+    if args.data_root is not None and (args.train_image_paths or args.val_image_paths):
         parser.error("--data_root discovers image paths; omit image-path manifests.")
     return args
 
@@ -105,7 +147,8 @@ def run_epoch(model, loader, device: str, optimizer=None, scheduler=None,
                 (loss + auxiliary_loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
             count = (labels != -100).sum().item()
             total_loss += loss.item() * count
             total_tokens += count
@@ -144,9 +187,20 @@ def main():
         word_embeddings_tensor=str(Path(args.embeddings_path).expanduser().resolve()),
         projection_dim=args.projection_dim, expansion_factor=args.expansion_factor,
         head_dim=args.head_dim, q_head=args.q_head, kv_head=args.kv_head,
+        dropout_ratio=args.dropout_ratio, theta=args.theta,
+        use_moe=args.use_moe, num_experts=args.num_experts,
+        load_balancing_loss_weight=args.load_balancing_loss_weight,
+        fine_tuning=args.fine_tuning, lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         clip_model_id=args.clip_model_id,
     )
     model = VLM(**model_config, device=args.device).to(args.device)
+    if args.init_checkpoint is not None:
+        checkpoint = torch.load(args.init_checkpoint.expanduser(),
+                                map_location="cpu", weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"])
+    if args.fine_tuning:
+        model.begin_fine_tunning()
     if max(tokenizer.get_vocab().values()) >= model.vocabulary_size:
         raise ValueError("Tokenizer IDs exceed the embedding matrix vocabulary.")
     if args.data_root:
