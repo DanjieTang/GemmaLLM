@@ -571,6 +571,8 @@ class VLM(nn.Module):
             raise ValueError("Supply image_paths or cached image_tokens, not both.")
         if image_paths is None:
             image_paths = [None] * batch_size
+        # Before: image_paths = ["photo.jpg", "", None]
+        # After:  image_paths = ["photo.jpg", None, None]
         image_paths = [path or None for path in image_paths]
         if batch_size != len(image_paths):
             raise ValueError("Mismatch between text and image inputs")
@@ -590,7 +592,7 @@ class VLM(nn.Module):
             attention_mask = attention_mask.to(device=device, dtype=torch.bool)
             if attention_mask.shape != token_ids.shape:
                 raise ValueError("attention_mask must match token_ids.")
-            if not attention_mask[:, 0].all() or (
+            if not attention_mask[:, 0].all() or (  # At least one real token, with padding only at the end.
                 attention_mask[:, 1:] & ~attention_mask[:, :-1]
             ).any():
                 raise ValueError("Only nonempty, right-padded text inputs are supported.")
@@ -615,15 +617,23 @@ class VLM(nn.Module):
                     device=device,
                     dtype=text_embeddings.dtype,
                 )
-            if image_tokens.shape != (len(image_indices), 1, text_embeddings.shape[-1]):
+            if image_tokens.shape != (len(image_indices), 1, text_embeddings.shape[-1]):  # Example: image_tokens.shape == (3, 1, 768)
                 raise ValueError("Cached image tokens have an incompatible shape.")
             input_embeddings[image_indices, :self.visual_seq_len] = image_tokens
             input_embeddings[image_indices, self.visual_seq_len] = (
                 self.seperation_token.to(text_embeddings.dtype)
             )
+            # Mark real tokens as True and padding or unused positions as False.
+            # With an image: [image, separator, word1, word2, padding]
+            # Mask:         [True,  True,      True,  True,  False]
+            # Text only:    [word1, word2, padding, unused, unused]
+            # Mask:         [True,  True,  False,   False,  False]
+            # Start with every position marked as padding.
             valid_token_mask = torch.zeros(batch_size, seq_len, device=device,
                                           dtype=torch.bool)
+            # Copy the text mask into the positions where text tokens were placed.
             valid_token_mask[batch_indices, text_positions] = attention_mask
+            # Mark the image token and separator as valid for samples with images.
             valid_token_mask[image_indices, :self.multimodal_prefix_len] = True
 
         # Padding is strictly after the text, so the shared causal mask
@@ -646,41 +656,3 @@ class VLM(nn.Module):
             # for text-only samples, preserving batch order and gradients.
             logits = logits[batch_indices, text_positions]
         return logits.contiguous(), load_balancing_loss
-
-    @torch.inference_mode()
-    def generate(self, image_path: str | PathLike[str], bos_token_id: int,
-                 eos_token_id: int, max_new_tokens: int = 256,
-                 temperature: float = 0.0, pad_token_id: int | None = None) -> list[int]:
-        """Generate one annotation, encoding the image once; no KV cache yet."""
-        if max_new_tokens < 1 or temperature < 0:
-            raise ValueError("max_new_tokens must be positive and temperature nonnegative.")
-        for token_id in (bos_token_id, eos_token_id, pad_token_id):
-            if token_id is not None and not 0 <= token_id < self.vocabulary_size:
-                raise ValueError("Special token ID outside the vocabulary.")
-        was_training = self.training
-        self.eval()
-        try:
-            device = self.word_embeddings_tensor.device
-            image_tokens = self._encode_images([image_path], device=device,
-                                               dtype=self.seperation_token.dtype)
-            tokens = torch.tensor([[bos_token_id]], device=device)
-            generated = []
-            for _ in range(min(max_new_tokens, self.max_context_length)):
-                logits, _ = self(tokens, image_tokens=image_tokens)
-                scores = logits[0, -1].clone()
-                for token_id in (bos_token_id, pad_token_id):
-                    if token_id is not None and token_id != eos_token_id:
-                        scores[token_id] = float("-inf")
-                if temperature == 0:
-                    next_token = scores.argmax().item()
-                else:
-                    next_token = torch.multinomial(
-                        (scores / temperature).softmax(-1), 1
-                    ).item()
-                if next_token == eos_token_id:
-                    break
-                generated.append(next_token)
-                tokens = torch.cat((tokens, tokens.new_tensor([[next_token]])), dim=1)
-            return generated
-        finally:
-            self.train(was_training)
