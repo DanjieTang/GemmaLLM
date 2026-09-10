@@ -42,6 +42,6 @@ Latest speed = 153.82 tokens/s
 
 ## Training detail.
 
-    a) 665 Million parameters Mixture of Experts Architecture
+    a) 199.7 Million parameters Mixture of Experts Architecture
 
-    b) Contextual length of 64 tokens.
+    b) Contextual length of 256 tokens.
