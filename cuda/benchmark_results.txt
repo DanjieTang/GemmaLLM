@@ -1,0 +1,19 @@
+=== CPU naive ===
+CPU naive: C[4096x4096] = A[4096x4096] * B[4096x4096]
+Compute time: 154841 ms (0.887614 GFLOPS)
+Max sample error: 0
+
+=== CPU tiled ===
+CPU tiled: C[4096x4096] = A[4096x4096] * B[4096x4096]
+Compute time: 5210.48 ms (26.3774 GFLOPS)
+Max sample error: 0
+
+=== CUDA naive ===
+CUDA naive: C[4096x4096] = A[4096x4096] * B[4096x4096]
+Kernel time: 331.425 ms (414.691 GFLOPS)
+Max sample error: 0
+
+=== CUDA tiled ===
+CUDA tiled: C[4096x4096] = A[4096x4096] * B[4096x4096]
+Kernel time: 89.9292 ms (1528.3 GFLOPS)
+Max sample error: 0

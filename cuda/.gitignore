@@ -1,0 +1,46 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info/
+wheels/
+
+# Data files
+*.bin
+
+# Compiled CUDA/C++ binaries
+# bare names match at any depth, extensionless compiled outputs
+verify
+print_example
+transpose/verify_transpose
+/device_function
+/fast_mat_mul
+/matrix_element
+/matrix_multiplication
+/matrix_multiplication_cpu_naive
+/matrix_multiplication_cpu_tiled
+/matrix_multiplication_gpu_tiled
+/matrix_multiplication_gpu_tiled_opt
+/test
+/vector_mul
+/vector_mul_pro
+/vector_reduction
+/fast_matmul/benchmark
+/fast_matmul/example
+/fast_matmul/test
+/normalization/example_normalization
+/normalization/normalization
+/normalization/validation
+/small_nn/benchmark
+/small_nn/model
+/softmax/enum_class_example
+/softmax/example_softmax
+/softmax/softmax
+/softmax/softmax_check
+/softmax/template_example
+/speed_comparison/reduction_vs_loop
+/transformer/transformer_layer
+/transformer/example_transformer_layer
+/transformer/tensors/
