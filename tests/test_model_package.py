@@ -17,6 +17,7 @@ import model
         ("MOE", "moe"),
         ("LLMLayer", "llm_layer"),
         ("LLM", "llm"),
+        ("MTPModule", "mtp"),
         ("VLM", "vlm"),
         ("KVCache", "cache"),
         ("PastKeyValues", "cache"),

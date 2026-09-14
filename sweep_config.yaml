@@ -32,7 +32,7 @@ lora_alpha: 32
 # init_checkpoint: checkpoints/pretrained/latest.pt
 
 # Training Hyperparameters
-epochs: 10
+epochs: 3
 batch_size: 16
 
 # Generate and print one validation image annotation every N training iterations.

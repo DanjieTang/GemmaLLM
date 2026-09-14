@@ -12,6 +12,7 @@ The PyTorch architecture lives in the `model/` package:
 | `moe.py` | `MOE`: expert routing and load-balancing loss |
 | `llm_layer.py` | `LLMLayer`: attention and feed-forward decoder block |
 | `llm.py` | `LLM`: decoder stack and vocabulary classifier |
+| `mtp.py` | `MTPModule`: sequential multi-token prediction block with a shared output head |
 | `vlm.py` | `VLM`: CLIP image encoding and text/image fusion |
 | `cache.py` | `KVCache`, `PastKeyValues`, and `VLMCache`: shared cache types |
 

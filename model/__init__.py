@@ -6,6 +6,7 @@ from .feed_forward import FeedForward
 from .llm import LLM
 from .llm_layer import LLMLayer
 from .moe import MOE
+from .mtp import MTPModule
 from .rope import ROPEEmbedding
 from .vlm import VLM
 
@@ -19,6 +20,7 @@ __all__ = [
     "LLM",
     "LLMLayer",
     "MOE",
+    "MTPModule",
     "PastKeyValues",
     "ROPEEmbedding",
     "VLM",

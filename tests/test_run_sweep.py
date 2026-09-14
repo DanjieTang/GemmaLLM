@@ -89,6 +89,30 @@ def test_empty_folder_list_rejected():
         normalize_grid(OrderedDict(train_folders=[]), {"train_folders"})
 
 
+def test_mtp_sweep_inherits_shared_options_and_preserves_folder_lists(tmp_path, sweep_config):
+    from train_mtp import parse_args as parse_mtp_args
+
+    with sweep_config.open("a") as config:
+        config.write("mtp_depth:\n  - 1\n  - 2\nmtp_loss_weight: 0.2\n")
+    assert {"mtp_depth", "mtp_loss_weight", "data_root", "train_folders"} <= read_train_args(
+        ROOT / "train_mtp.py"
+    )
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "run_sweep.py"),
+         "--config", str(sweep_config), "--train-script", str(ROOT / "train_mtp.py"),
+         "--state-file", str(tmp_path / "mtp-state.json"), "--dry-run"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    commands = [shlex.split(line.removeprefix("Command: "))
+                for line in result.stdout.splitlines() if line.startswith("Command: ")]
+    assert len(commands) == 4
+    parsed = [parse_mtp_args(command[2:]) for command in commands]
+    assert {args.mtp_depth for args in parsed} == {1, 2}
+    assert all(args.train_folders == ["train", "OpenImageV7_train"] for args in parsed)
+    assert all(args.mtp_loss_weight == 0.2 for args in parsed)
+    assert not (tmp_path / "mtp-state.json").exists()
+
+
 def test_inference_interval_can_be_swept_or_disabled():
     config = OrderedDict(inference_every=[0, 1000, 2000])
     assert set(config) <= read_train_args(ROOT / "train.py")

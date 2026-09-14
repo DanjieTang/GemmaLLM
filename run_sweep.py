@@ -104,9 +104,26 @@ def parse_simple_yaml(path: Path) -> OrderedDict:
 
 def read_train_args(train_script: Path, multi_value_only: bool = False) -> set:
     """Inspect argparse declarations without importing the training dependencies."""
-    tree = ast.parse(train_script.read_text(encoding="utf-8"))
+    pending = [train_script.resolve()]
+    visited = set()
+    trees = []
+    while pending:
+        source = pending.pop()
+        if source in visited:
+            continue
+        visited.add(source)
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        trees.append(tree)
+        # Trainers may extend a shared parser imported from a local module.
+        # Read its declarations statically, keeping dry runs dependency-free.
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.ImportFrom) and node.module and not node.level
+                    and any(alias.name == "build_parser" for alias in node.names)):
+                parser_source = source.parent.joinpath(*node.module.split(".")).with_suffix(".py")
+                if parser_source.is_file():
+                    pending.append(parser_source.resolve())
     names = set()
-    for node in ast.walk(tree):
+    for node in itertools.chain.from_iterable(ast.walk(tree) for tree in trees):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "add_argument"):
             continue

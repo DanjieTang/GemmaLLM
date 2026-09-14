@@ -26,7 +26,8 @@ def parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError("Expected true or false.")
 
 
-def parse_args(argv: list[str] | None = None):
+def build_parser() -> argparse.ArgumentParser:
+    """Build the shared training CLI, allowing other trainers to add options."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_root", type=str, default=None,
                         help="Parent of paired dataset folders (default: data).")
@@ -81,7 +82,11 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--project", default=None)
     parser.add_argument("--entity", default=None)
     parser.add_argument("--run_name", default=None)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
+    """Validate shared training settings before loading models or datasets."""
     for name in ("epochs", "batch_size", "max_context_length", "num_layer",
                  "max_samples", "max_steps", "projection_dim", "q_head",
                  "kv_head", "head_dim", "expansion_factor", "theta",
@@ -116,6 +121,11 @@ def parse_args(argv: list[str] | None = None):
     if args.data_root is not None and (args.train_image_paths or args.val_image_paths):
         parser.error("--data_root discovers image paths; omit image-path manifests.")
     return args
+
+
+def parse_args(argv: list[str] | None = None):
+    parser = build_parser()
+    return validate_args(parser.parse_args(argv), parser)
 
 
 def unpack_batch(batch):

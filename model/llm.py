@@ -56,7 +56,25 @@ class LLM(nn.Module):
         valid_token_mask: torch.Tensor | None = None,
         past_key_values: PastKeyValues | None = None,
         use_cache: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, PastKeyValues]:
+        output_hidden_states: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, PastKeyValues]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, PastKeyValues]
+    ):
+        """Predict next tokens, optionally returning hidden states and a KV cache.
+
+        Return scenarios (use_cache, output_hidden_states):
+            1. (False, False): (logits, auxiliary_loss)
+               Ordinary training; this is the default.
+            2. (True, False): (logits, auxiliary_loss, cache)
+               Ordinary autoregressive generation with cached attention.
+            3. (False, True): (logits, auxiliary_loss, hidden_states)
+               Joint MTP training using the main model's hidden states.
+            4. (True, True): (logits, auxiliary_loss, hidden_states, cache)
+               Cached generation with hidden states available to a draft module.
+        """
         if past_key_values is not None and not use_cache:
             raise ValueError("past_key_values requires use_cache=True.")
         past_length = 0
@@ -111,10 +129,16 @@ class LLM(nn.Module):
 
         load_balancing_loss = (load_balancing_sum / self.num_layer) * self.load_balancing_loss_weight
 
+        hidden_states = tensor
+
         # Classification
         tensor = self.output_norm(tensor)
         tensor = self.classifier(tensor)
 
+        if output_hidden_states:
+            if use_cache:
+                return tensor, load_balancing_loss, hidden_states, tuple(present_key_values)
+            return tensor, load_balancing_loss, hidden_states
         if use_cache:
             return tensor, load_balancing_loss, tuple(present_key_values)
         return tensor, load_balancing_loss

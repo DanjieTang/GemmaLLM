@@ -154,6 +154,13 @@ class VLM(nn.Module):
 
         return image_tokens.to(device=device, dtype=dtype)
 
+    def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Look up/project shared text embeddings to [batch, tokens, hidden_dim]."""
+        embeddings = self.word_embeddings_tensor[token_ids].float()
+        if self.text_projection:
+            embeddings = self.text_token_projection(embeddings)
+        return embeddings
+
     def forward(
         self,
         token_ids: torch.Tensor,
@@ -162,7 +169,13 @@ class VLM(nn.Module):
         image_tokens: torch.Tensor | None = None,
         past_key_values: VLMCache | None = None,
         use_cache: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, VLMCache]:
+        output_hidden_states: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, VLMCache]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, VLMCache]
+    ):
         """Predict next text tokens; attention_mask marks right-padded text inputs.
 
         image_tokens optionally supplies projected CLIP tokens [batch, 1, hidden]
@@ -172,6 +185,11 @@ class VLM(nn.Module):
         initial forward pass (one token or a full text prompt). Later passes
         supply only new text tokens and past_key_values; the cache already
         contains the image and separator keys/values.
+
+        output_hidden_states=True adds raw final hidden states as the third
+        return value, aligned with text positions only (no image prefix), with
+        shape [batch, new_text_tokens, hidden_dim]. Gradients are retained.
+        When requested, the VLMCache is always the last return value.
         """
         batch_size, text_seq_len = token_ids.shape
         past_text_length = 0
@@ -197,9 +215,7 @@ class VLM(nn.Module):
         if batch_size != len(image_paths):
             raise ValueError("Mismatch between text and image inputs")
 
-        text_embeddings = self.word_embeddings_tensor[token_ids].float()
-        if self.text_projection:
-            text_embeddings = self.text_token_projection(text_embeddings)
+        text_embeddings = self.embed_tokens(token_ids)
         device = text_embeddings.device
         image_indices = list(range(batch_size)) if image_tokens is not None else [
             index for index, path in enumerate(image_paths) if path is not None
@@ -265,16 +281,18 @@ class VLM(nn.Module):
         # Padding is strictly after the text, so the shared causal mask
         # already prevents every real token from attending to padding.
         seq_len = input_embeddings.shape[1]
+        hidden_kwargs = {"output_hidden_states": True} if output_hidden_states else {}
         if use_cache:
             # LLM derives the rectangular causal mask and RoPE offset from the
             # cache length, which already includes the image and separator.
-            logits, load_balancing_loss, present_key_values = self.llm(
+            llm_output = self.llm(
                 input_embeddings,
                 fine_tuning=self.fine_tuning,
                 valid_token_mask=valid_token_mask,
                 past_key_values=(None if past_key_values is None
                                  else past_key_values.past_key_values),
                 use_cache=True,
+                **hidden_kwargs,
             )
         else:
             causal_mask = torch.full(
@@ -283,18 +301,25 @@ class VLM(nn.Module):
                 device=device,
                 dtype=input_embeddings.dtype,
             ).triu(diagonal=1)
-            logits, load_balancing_loss = self.llm(
+            llm_output = self.llm(
                 input_embeddings,
                 causal_mask,
                 self.fine_tuning,
                 valid_token_mask=valid_token_mask,
+                **hidden_kwargs,
             )
+        logits, load_balancing_loss = llm_output[:2]
+        if output_hidden_states:
+            hidden_states = llm_output[2]
         if image_indices:
             # Select text predictions at offset 2 for image samples and 0
             # for text-only samples, preserving batch order and gradients.
             logits = logits[batch_indices, text_positions]
+            if output_hidden_states:
+                hidden_states = hidden_states[batch_indices, text_positions]
+        result = (logits.contiguous(), load_balancing_loss)
+        if output_hidden_states:
+            result += (hidden_states,)
         if use_cache:
-            return logits.contiguous(), load_balancing_loss, VLMCache(
-                present_key_values, past_text_length + text_seq_len,
-            )
-        return logits.contiguous(), load_balancing_loss
+            result += (VLMCache(llm_output[-1], past_text_length + text_seq_len),)
+        return result
