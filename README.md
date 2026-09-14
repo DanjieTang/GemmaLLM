@@ -63,3 +63,7 @@ Latest speed = 153.82 tokens/s
     a) 199.7 Million parameters Mixture of Experts Architecture
 
     b) Contextual length of 256 tokens.
+
+## Image annotation.
+
+    a) Used gemma 4 31b served with vllm on dgx spark to annotate 2 million(2,074,056) images.
