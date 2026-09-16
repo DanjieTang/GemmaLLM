@@ -13,7 +13,10 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from lazy_dataloader import prepare_annotation_dataset, prepare_dataset
+from lazy_dataloader import (
+    prepare_annotation_dataset, prepare_dataset, prepare_mixed_dataset,
+    prepare_wikipedia_dataset,
+)
 from model import MTPModule, VLM
 from train import (
     build_parser, iter_validation_images, prepare_batch,
@@ -250,7 +253,20 @@ def main():
         load_initial_checkpoint(args.init_checkpoint, model, special_ids)
     if max(tokenizer.get_vocab().values()) >= base_model.vocabulary_size:
         raise ValueError("Tokenizer IDs exceed the embedding matrix vocabulary.")
-    if args.data_root:
+    if args.wikipedia_dir is not None and args.data_root:
+        train_loader, val_loader = prepare_mixed_dataset(
+            args.data_root, args.train_folders, args.val_folders,
+            args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
+            args.max_context_length, base_model.vocabulary_size, tokenizer,
+            num_workers=args.num_workers, max_samples=args.max_samples,
+        )
+    elif args.wikipedia_dir is not None:
+        train_loader, val_loader = prepare_wikipedia_dataset(
+            args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
+            args.max_context_length, base_model.vocabulary_size, tokenizer,
+            num_workers=args.num_workers, max_samples=args.max_samples,
+        )
+    elif args.data_root:
         train_loader, val_loader = prepare_annotation_dataset(
             args.data_root, args.train_folders, args.val_folders, args.batch_size,
             args.max_context_length, base_model.vocabulary_size, **special_ids,
@@ -274,7 +290,7 @@ def main():
                 print_image_inference(base_model, tokenizer, image_path, step,
                                       args.inference_max_new_tokens)
         else:
-            print("Image inference disabled: legacy validation has no image manifest.")
+            print("Image inference disabled: text-only validation has no images.")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=args.weight_decay)

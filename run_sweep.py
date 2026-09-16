@@ -16,10 +16,13 @@ from typing import Dict, List, Tuple
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run train.py over all hyperparameter combinations in a YAML-like sweep config."
+        description="Run training over all hyperparameter combinations in a YAML-like sweep config."
     )
     parser.add_argument("--config", type=str, default="sweep_config.yaml")
-    parser.add_argument("--train-script", type=str, default="train.py")
+    parser.add_argument(
+        "--train-script", type=str, default="train.py",
+        help="Training script when the config omits mtp; mtp selects train_mtp.py or train.py.",
+    )
     parser.add_argument("--state-file", type=str, default="sweep_progress.json")
     parser.add_argument("--python", type=str, default=sys.executable)
     parser.add_argument("--continue-on-error", action="store_true")
@@ -206,7 +209,7 @@ def build_command(
 ) -> List[str]:
     cmd = [python_exe, str(train_script)]
     for key, value in params.items():
-        if value is None:
+        if key == "mtp" or value is None:
             continue
         cmd.append(f"--{key}")
         cmd.extend(str(item) for item in (value if isinstance(value, list) else [value]))
@@ -225,27 +228,51 @@ def checkpoint_directory(params: Dict, run_name: str) -> Path:
 def main():
     args = parse_args()
     config_path = Path(args.config).resolve()
-    train_script = Path(args.train_script).resolve()
     state_path = Path(args.state_file).resolve()
 
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    if not train_script.exists():
-        raise FileNotFoundError(f"Train script not found: {train_script}")
-
     config = parse_simple_yaml(config_path)
-    valid_args = read_train_args(train_script)
-    unknown = [k for k in config.keys() if k not in valid_args]
-    if unknown:
-        raise ValueError(
-            f"Unknown config keys for {train_script.name}: {unknown}. "
-            f"Allowed args: {sorted(valid_args)}"
-        )
+    if "mtp" in config:
+        mtp_values = config["mtp"] if isinstance(config["mtp"], list) else [config["mtp"]]
+        if not mtp_values or any(type(value) is not bool for value in mtp_values):
+            raise ValueError("Config key 'mtp' must be true, false, or a nonempty list of booleans.")
+        scripts = {
+            value: Path(__file__).resolve().with_name("train_mtp.py" if value else "train.py")
+            for value in mtp_values
+        }
+    else:
+        scripts = {None: Path(args.train_script).resolve()}
 
-    multi_value_args = read_train_args(train_script, multi_value_only=True)
-    keys, value_lists = normalize_grid(config, multi_value_args)
+    valid_args_by_mode = {}
+    configs_by_mode = {}
+    multi_value_args = set()
+    for mode, train_script in scripts.items():
+        if not train_script.is_file():
+            raise FileNotFoundError(f"Train script not found: {train_script}")
+        valid_args = read_train_args(train_script)
+        mode_config = config.copy()
+        if mode is not None:
+            mode_config["mtp"] = mode
+        if mode is False:
+            # Remove inactive options before expanding lists into runs.
+            for key in ("mtp_depth", "mtp_loss_weight"):
+                mode_config.pop(key, None)
+        unknown = [key for key in mode_config if key != "mtp" and key not in valid_args]
+        if unknown:
+            raise ValueError(
+                f"Unknown config keys for {train_script.name}: {unknown}. "
+                f"Allowed args: {sorted(valid_args | {'mtp'})}"
+            )
+        valid_args_by_mode[mode] = valid_args
+        configs_by_mode[mode] = mode_config
+        multi_value_args.update(read_train_args(train_script, multi_value_only=True))
+
     varying_keys = get_varying_keys(config, multi_value_args)
-    combos = [dict(zip(keys, values)) for values in itertools.product(*value_lists)]
+    combos = []
+    for mode_config in configs_by_mode.values():
+        keys, value_lists = normalize_grid(mode_config, multi_value_args)
+        combos.extend(dict(zip(keys, values)) for values in itertools.product(*value_lists))
 
     state = load_state(state_path)
     completed = state.get("completed", {})
@@ -266,12 +293,14 @@ def main():
     signal.signal(signal.SIGINT, handle_sigint)
 
     for idx, params in enumerate(combos, start=1):
+        train_script = scripts[params.get("mtp")]
+        valid_args = valid_args_by_mode[params.get("mtp")]
         run_id = to_run_id(params)
         if not args.force_rerun and run_id in completed:
             print(f"[{idx}/{total}] SKIP completed: {params}")
             continue
 
-        run_name = make_run_name(params, varying_keys)
+        run_name = make_run_name(params, [key for key in varying_keys if key in params])
         command_params = dict(params)
         if "output_dir" in valid_args:
             command_params["output_dir"] = str(checkpoint_directory(params, run_name))

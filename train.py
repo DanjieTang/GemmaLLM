@@ -1,4 +1,4 @@
-"""Train the custom CLIP-conditioned annotation decoder or legacy token arrays."""
+"""Train on image annotations, Wikipedia shards, or legacy token arrays."""
 
 import argparse
 from collections.abc import Callable, Iterator
@@ -9,11 +9,15 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import ConcatDataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from generate import generate
-from lazy_dataloader import AnnotationDataset, prepare_annotation_dataset, prepare_dataset
+from lazy_dataloader import (
+    AnnotationDataset, WikipediaDataset, prepare_annotation_dataset, prepare_dataset,
+    prepare_mixed_dataset, prepare_wikipedia_dataset,
+)
 from model import VLM
 
 
@@ -31,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_root", type=str, default=None,
                         help="Parent of paired dataset folders (default: data).")
+    parser.add_argument("--wikipedia_dir", type=Path, default=None,
+                        help="Wikipedia shard root; combine with --data_root for mixed training.")
+    parser.add_argument("--wikipedia_languages", nargs="+", default=["all"],
+                        help="Wikipedia language folders, or all (default: all).")
     parser.add_argument("--train_folders", nargs="+", default=["train", "OpenImageV7_train"])
     parser.add_argument("--val_folders", nargs="+", default=["val", "OpenImageV7_val"])
     parser.add_argument("--tokenizer_path", default=str(Path.home() / "models/gemma-4-E2B-it"))
@@ -69,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=None,
-                        help="Limit pairs per train/validation dataset for smoke tests.")
+                        help="Limit examples per source per split for smoke tests.")
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Limit batches per training/validation epoch for smoke tests.")
     parser.add_argument("--inference_every", type=int, default=1000,
@@ -112,11 +120,21 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
     if args.kv_head < 1 or args.q_head % args.kv_head or args.head_dim % 2:
         parser.error("q_head must be divisible by kv_head and head_dim must be even.")
     legacy = args.train_path is not None or args.val_path is not None
+    wikipedia = args.wikipedia_dir is not None
+    if wikipedia and (legacy or args.train_image_paths or args.val_image_paths):
+        parser.error("--wikipedia_dir cannot be combined with legacy token/image arrays.")
+    if args.wikipedia_languages != ["all"]:
+        if "all" in args.wikipedia_languages:
+            parser.error("Use --wikipedia_languages all alone, or list individual languages.")
+        if not wikipedia:
+            parser.error("--wikipedia_languages requires --wikipedia_dir.")
+        if len(set(args.wikipedia_languages)) != len(args.wikipedia_languages):
+            parser.error("--wikipedia_languages must be distinct.")
     if legacy and (args.train_path is None or args.val_path is None):
         parser.error("Legacy training requires both --train_path and --val_path.")
     if legacy and args.data_root is not None:
         parser.error("Choose --data_root or legacy --train_path/--val_path.")
-    if not legacy and args.data_root is None:
+    if not legacy and not wikipedia and args.data_root is None:
         args.data_root = "data"
     if args.data_root is not None and (args.train_image_paths or args.val_image_paths):
         parser.error("--data_root discovers image paths; omit image-path manifests.")
@@ -148,7 +166,12 @@ def prepare_batch(batch, device: str) -> dict:
 
 def iter_validation_images(dataset) -> Iterator[str]:
     """Read paired image paths without loading annotations; support legacy pairs too."""
-    if isinstance(dataset, AnnotationDataset):
+    if isinstance(dataset, ConcatDataset):
+        for child in dataset.datasets:
+            yield from iter_validation_images(child)
+    elif isinstance(dataset, WikipediaDataset):
+        return
+    elif isinstance(dataset, AnnotationDataset):
         for _, image_path in dataset.samples:
             yield image_path
     else:
@@ -253,7 +276,20 @@ def main():
         model.begin_fine_tunning()
     if max(tokenizer.get_vocab().values()) >= model.vocabulary_size:
         raise ValueError("Tokenizer IDs exceed the embedding matrix vocabulary.")
-    if args.data_root:
+    if args.wikipedia_dir is not None and args.data_root:
+        train_loader, val_loader = prepare_mixed_dataset(
+            args.data_root, args.train_folders, args.val_folders,
+            args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
+            args.max_context_length, model.vocabulary_size, tokenizer,
+            num_workers=args.num_workers, max_samples=args.max_samples,
+        )
+    elif args.wikipedia_dir is not None:
+        train_loader, val_loader = prepare_wikipedia_dataset(
+            args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
+            args.max_context_length, model.vocabulary_size, tokenizer,
+            num_workers=args.num_workers, max_samples=args.max_samples,
+        )
+    elif args.data_root:
         train_loader, val_loader = prepare_annotation_dataset(
             args.data_root, args.train_folders, args.val_folders, args.batch_size,
             args.max_context_length, model.vocabulary_size, **special_ids,
@@ -277,7 +313,7 @@ def main():
                 print_image_inference(model, tokenizer, image_path, step,
                                       args.inference_max_new_tokens)
         else:
-            print("Image inference disabled: legacy validation has no image manifest.")
+            print("Image inference disabled: text-only validation has no images.")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=args.weight_decay)

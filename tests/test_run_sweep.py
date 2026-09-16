@@ -113,6 +113,44 @@ def test_mtp_sweep_inherits_shared_options_and_preserves_folder_lists(tmp_path, 
     assert not (tmp_path / "mtp-state.json").exists()
 
 
+@pytest.mark.parametrize(("mode", "depths", "expected_depths", "base_runs"), [
+    ("true", "1", [1], 0),
+    ("true", "\n  - 1\n  - 2", [1, 2], 0),
+    ("false", "\n  - 1\n  - 2", [], 1),
+    ("false", "", [], 1),
+    ("\n  - true\n  - false", "\n  - 1\n  - 2", [1, 2], 1),
+])
+def test_mtp_options_only_expand_enabled_runs(
+    tmp_path, mode, depths, expected_depths, base_runs,
+):
+    from train_mtp import parse_args as parse_mtp_args
+
+    config = tmp_path / "sweep.yaml"
+    config.write_text(
+        f"mtp: {mode}\nmtp_depth: {depths}\n"
+        "mtp_loss_weight: 0.3\noutput_dir: checkpoints/test\n"
+    )
+    state = tmp_path / "state.json"
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "run_sweep.py"), "--config", str(config),
+         "--state-file", str(state), "--dry-run"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    commands = [shlex.split(line.removeprefix("Command: "))
+                for line in result.stdout.splitlines() if line.startswith("Command: ")]
+    base_commands = [cmd for cmd in commands if Path(cmd[1]).name == "train.py"]
+    mtp_commands = [cmd for cmd in commands if Path(cmd[1]).name == "train_mtp.py"]
+    assert len(commands) == len(expected_depths) + base_runs
+    assert len(base_commands) == base_runs
+    assert [parse_mtp_args(cmd[2:]).mtp_depth for cmd in mtp_commands] == expected_depths
+    for cmd in base_commands:
+        assert "--mtp_depth" not in cmd and "--mtp_loss_weight" not in cmd
+        args = parse_args(cmd[2:])
+        assert "mtp_depth" not in args.run_name
+        assert "mtp_depth" not in str(args.output_dir)
+    assert not state.exists()
+
+
 def test_inference_interval_can_be_swept_or_disabled():
     config = OrderedDict(inference_every=[0, 1000, 2000])
     assert set(config) <= read_train_args(ROOT / "train.py")

@@ -1,9 +1,13 @@
-from pathlib import Path
+from bisect import bisect_right
+from collections import OrderedDict
 from functools import partial
+import hashlib
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 from data_preprocessing.tokenize_annotations import (
     IMAGE_SUFFIXES, annotation_directory, iter_files,
@@ -190,3 +194,193 @@ def prepare_dataset(
     )
 
     return train_loader, val_loader
+
+
+class WikipediaDataset(Dataset):
+    """Memory-map completed Wikipedia shards; return unpadded token windows.
+
+    Only a bounded set of shard mappings is kept per worker. Row offsets index
+    the manifests without allocating an entry for every training example.
+    """
+
+    def __init__(self, directory: str | Path, languages: list[str], split: str,
+                 max_context_length: int, vocabulary_size: int,
+                 special_token_ids: dict, tokenizer_sha256: str,
+                 max_samples: int | None = None):
+        self.vocabulary_size = vocabulary_size
+        self.shards = []
+        self.offsets = [0]
+        self._mappings = OrderedDict()
+        for language in languages:
+            folder = Path(directory).expanduser() / language
+            manifest_path = folder / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError(f"{folder}: no completed Wikipedia manifest.")
+            manifest = json.loads(manifest_path.read_text())
+            config = manifest["config"]
+            if config["format_version"] != 1 or config["language"] != language:
+                raise ValueError(f"{manifest_path}: unsupported format or wrong language.")
+            width = config["context_length"] + 1
+            if not 2 <= width <= max_context_length + 1:
+                raise ValueError(f"{manifest_path}: shard context exceeds --max_context_length.")
+            if (config["special_token_ids"] != special_token_ids
+                    or config["tokenizer_sha256"] != tokenizer_sha256):
+                raise ValueError(f"{manifest_path}: tokenizer differs from preprocessing.")
+            stats = manifest["splits"][split]
+            if sum(shard["rows"] for shard in stats["shards"]) != stats["rows"]:
+                raise ValueError(f"{manifest_path}: inconsistent shard row counts.")
+            for shard in stats["shards"]:
+                paths = (folder / split / shard["tokens"],
+                         folder / split / shard["lengths"])
+                tokens, lengths = (np.load(path, mmap_mode="r", allow_pickle=False)
+                                   for path in paths)
+                rows = shard["rows"]
+                if (rows < 1 or tokens.shape != (rows, width)
+                        or lengths.shape != (rows,)
+                        or tokens.dtype != np.int32 or lengths.dtype != np.int32):
+                    raise ValueError(f"{paths[0]}: invalid token/length shapes or dtypes.")
+                self.shards.append(paths)
+                self.offsets.append(self.offsets[-1] + rows)
+        self.length = self.offsets[-1]
+        if max_samples is not None:
+            if max_samples < 1:
+                raise ValueError("max_samples must be positive.")
+            self.length = min(self.length, max_samples)
+        if not self.length:
+            raise ValueError(f"{directory}: no Wikipedia {split} windows.")
+        print(f"Wikipedia {split}: {self.length:,} windows across "
+              f"{', '.join(languages)}", flush=True)
+
+    def __len__(self):
+        return self.length
+
+    def __getstate__(self):
+        # Spawned DataLoader workers reopen mappings rather than pickle arrays.
+        return {**self.__dict__, "_mappings": OrderedDict()}
+
+    def __getitem__(self, index):
+        if not 0 <= index < self.length:
+            raise IndexError(index)
+        shard_index = bisect_right(self.offsets, index) - 1
+        if shard_index not in self._mappings:
+            self._mappings[shard_index] = tuple(
+                np.load(path, mmap_mode="r", allow_pickle=False)
+                for path in self.shards[shard_index]
+            )
+            if len(self._mappings) > 8:
+                self._mappings.popitem(last=False)
+        self._mappings.move_to_end(shard_index)
+        tokens, lengths = self._mappings[shard_index]
+        row = index - self.offsets[shard_index]
+        length = int(lengths[row])
+        if not 2 <= length <= tokens.shape[1]:
+            raise ValueError(f"{self.shards[shard_index][1]}: invalid length at row {row}.")
+        ids = tokens[row, :length].astype(np.int64, copy=True)
+        if ids.min() < 0 or ids.max() >= self.vocabulary_size:
+            raise ValueError(f"{self.shards[shard_index][0]}: token ID outside vocabulary.")
+        # Chunks may start/end mid-article: never insert BOS/EOS or truncate.
+        return torch.from_numpy(ids), None
+
+
+class WikipediaSampler(Sampler[int]):
+    """Shuffle shards and then their rows, using memory proportional to a shard."""
+
+    def __init__(self, dataset: WikipediaDataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __iter__(self):
+        offsets = self.dataset.offsets
+        shard_count = bisect_right(offsets, len(self.dataset) - 1)
+        for shard in torch.randperm(shard_count).tolist():
+            start = offsets[shard]
+            count = min(offsets[shard + 1], len(self.dataset)) - start
+            for row in torch.randperm(count).tolist():
+                yield start + row
+
+
+def prepare_wikipedia_dataset(
+    directory: str | Path, languages: list[str] | None, batch_size: int,
+    max_context_length: int, vocabulary_size: int, tokenizer,
+    num_workers: int = 0, max_samples: int | None = None,
+) -> tuple[DataLoader, DataLoader]:
+    """Load existing article splits; all completed languages are used by default."""
+    directory = Path(directory).expanduser()
+    if languages is None or languages == ["all"]:
+        languages = sorted(path.parent.name for path in directory.glob("*/manifest.json")
+                           if not path.parent.name.startswith("."))
+    elif "all" in languages:
+        raise ValueError("Use all alone, or list individual Wikipedia languages.")
+    if (not languages or len(set(languages)) != len(languages)
+            or any(Path(language).name != language or language.startswith(".")
+                   for language in languages)):
+        raise ValueError("Select distinct, completed Wikipedia language folders.")
+    if not tokenizer.is_fast:
+        raise ValueError("Wikipedia requires the fast tokenizer used for preprocessing.")
+    fingerprint = hashlib.sha256(tokenizer.backend_tokenizer.to_str().encode()).hexdigest()
+    special_ids = {name: getattr(tokenizer, name) for name in
+                   ("bos_token_id", "eos_token_id", "pad_token_id")}
+    datasets = [WikipediaDataset(
+        directory, languages, split, max_context_length, vocabulary_size,
+        special_ids, fingerprint, max_samples,
+    ) for split in ("train", "val")]
+    kwargs = dict(batch_size=batch_size, num_workers=num_workers,
+                  collate_fn=partial(collate_annotations,
+                                     pad_token_id=tokenizer.pad_token_id))
+    return (DataLoader(datasets[0], sampler=WikipediaSampler(datasets[0]), **kwargs),
+            DataLoader(datasets[1], shuffle=False, **kwargs))
+
+
+class GlobalShuffleSampler(Sampler[int]):
+    """Shuffle every example once without building a corpus-sized Python list.
+
+    The permutation uses four bytes per example (eight for >= 2**31 examples).
+    Only small slices are converted to Python indices for DataLoader workers.
+    """
+
+    def __init__(self, dataset: Dataset):
+        self.length = len(dataset)
+
+    def __len__(self):
+        return self.length
+
+    def __iter__(self):
+        dtype = torch.int32 if self.length < 2**31 else torch.int64
+        order = torch.randperm(self.length, dtype=dtype, device="cpu")
+        for chunk in order.split(65536):
+            yield from chunk.tolist()
+
+
+def prepare_mixed_dataset(
+    data_root: str, train_folders: list[str], val_folders: list[str],
+    wikipedia_dir: str | Path, wikipedia_languages: list[str] | None,
+    batch_size: int, max_context_length: int, vocabulary_size: int, tokenizer,
+    num_workers: int = 0, max_samples: int | None = None,
+) -> tuple[DataLoader, DataLoader]:
+    """Combine annotations and Wikipedia within each split, shuffling training.
+
+    Each image/annotation pair and each Wikipedia window is one example. There
+    is no oversampling; max_samples, when set, caps each source in each split.
+    """
+    special_ids = {name: getattr(tokenizer, name) for name in
+                   ("bos_token_id", "eos_token_id", "pad_token_id")}
+    annotation_loaders = prepare_annotation_dataset(
+        data_root, train_folders, val_folders, batch_size, max_context_length,
+        vocabulary_size, **special_ids, max_samples=max_samples,
+    )
+    wikipedia_loaders = prepare_wikipedia_dataset(
+        wikipedia_dir, wikipedia_languages, batch_size, max_context_length,
+        vocabulary_size, tokenizer, max_samples=max_samples,
+    )
+    datasets = [ConcatDataset([annotations.dataset, wikipedia.dataset])
+                for annotations, wikipedia in zip(annotation_loaders, wikipedia_loaders)]
+    for split, dataset in zip(("train", "val"), datasets):
+        print(f"Mixed {split}: {len(dataset.datasets[0]):,} image/annotation pairs + "
+              f"{len(dataset.datasets[1]):,} Wikipedia windows", flush=True)
+    kwargs = dict(batch_size=batch_size, num_workers=num_workers,
+                  collate_fn=partial(collate_annotations,
+                                     pad_token_id=tokenizer.pad_token_id))
+    return (DataLoader(datasets[0], sampler=GlobalShuffleSampler(datasets[0]), **kwargs),
+            DataLoader(datasets[1], shuffle=False, **kwargs))

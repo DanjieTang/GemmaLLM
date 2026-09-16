@@ -1,5 +1,13 @@
-# Paired datasets; folder lists are combined within each run.
+# Select train_mtp.py when true, or train.py when false.
+mtp: true
+# Additional future-token prediction steps; ignored when mtp is false.
+# Use a YAML list of depths to sweep multiple values.
+mtp_depth: 1
+
+# Shuffle image/annotation pairs and all Wikipedia languages together.
 data_root: data
+wikipedia_dir: data/wikipedia
+wikipedia_languages: all
 train_folders:
   - train
   - OpenImageV7_train
@@ -10,7 +18,7 @@ embeddings_path: data/gemma-4-31B-it-embeddings.pt
 clip_model_id: openai/clip-vit-large-patch14
 # tokenizer_path defaults to ~/models/gemma-4-E2B-it in train.py.
 # Each combination gets its own subdirectory under output_dir.
-output_dir: checkpoints/annotation_sweep
+output_dir: checkpoints/mixed_sweep
 
 # Model Architecture (~200M trainable parameters)
 num_layer: 4
