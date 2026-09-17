@@ -24,17 +24,17 @@ The PyTorch architecture lives in the `model/` package:
 
 ## Throughput optimizations
 
-    a) KV cache
+    a) KV cache: 5.476× speedup with a 1,024-token output.
 
-    b) MTP Speculative decoding
+    b) MTP Speculative decoding: 1.738× speedup on an English Wikipedia prediction task.
 
-    c) CUDA cublas implementation
+    c) CUDA cublas implementation: 1.33× speedup for a tensor size of (2, 64, 512) — (batch, sequence, hidden).
 
     d) Flash attention
 
 Original speed = 28.09 tokens/s
 
-Latest speed = 153.82 tokens/s
+Latest speed = 355.56 tokens/s
 
 ## Key insights from this implementation.
 
