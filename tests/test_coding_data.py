@@ -177,7 +177,8 @@ def test_corrupt_offsets_and_tokens_are_rejected(corpus):
 
 
 @pytest.mark.parametrize("trainer", [train, train_mtp])
-def test_both_trainers_update_weights_and_save_coding_checkpoint(corpus, tmp_path, trainer):
+def test_both_trainers_update_weights_and_save_coding_checkpoint(corpus, tmp_path, trainer,
+                                                                 capsys):
     root, _ = corpus
     embeddings = tmp_path / "embeddings.pt"
     torch.save(torch.randn(16, 6), embeddings)
@@ -187,7 +188,8 @@ def test_both_trainers_update_weights_and_save_coding_checkpoint(corpus, tmp_pat
              "--device", "cpu", "--max_context_length", "64", "--num_layer", "1",
              "--projection_dim", "4", "--head_dim", "2", "--q_head", "2",
              "--kv_head", "1", "--expansion_factor", "2", "--batch_size", "2",
-             "--max_steps", "1", "--inference_every", "1"]
+             "--max_steps", "1", "--image_inference_every", "1",
+             "--text_inference_every", "1", "--inference_max_new_tokens", "2"]
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
@@ -196,11 +198,15 @@ def test_both_trainers_update_weights_and_save_coding_checkpoint(corpus, tmp_pat
              patch("model.CLIPImageProcessor.from_pretrained", return_value=FakeVisionProcessor()), \
              patch.object(trainer, "prepare_annotation_dataset") as annotations, \
              patch.object(trainer, "prepare_wikipedia_dataset") as wikipedia, \
-             patch.object(trainer, "print_image_inference") as preview:
+             patch.object(train, "print_image_inference") as preview, \
+             patch.object(train, "print_text_inference",
+                          wraps=train.print_text_inference) as text_preview:
             trainer.main()
         annotations.assert_not_called()
         wikipedia.assert_not_called()
         preview.assert_not_called()
+        assert [call.args[3] for call in text_preview.call_args_list] == [1]
+        assert "[Text inference | iteration 1]" in capsys.readouterr().out
         saved = torch.load(output / "latest.pt", weights_only=True)
         assert torch.isfinite(torch.tensor(saved["loss"]))
         assert saved["optimizer_state_dict"]["state"]

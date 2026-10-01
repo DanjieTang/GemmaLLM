@@ -148,7 +148,7 @@ def test_both_entrypoints_train_validate_and_save_wikipedia(wikipedia, tmp_path,
         "--device", "cpu", "--max_context_length", "4", "--num_layer", "1",
         "--projection_dim", "4", "--head_dim", "2", "--q_head", "2",
         "--kv_head", "1", "--expansion_factor", "2", "--batch_size", "3",
-        "--max_steps", "1", "--inference_every", "1",
+        "--max_steps", "1", "--image_inference_every", "1",
     ]
     if trainer is train_mtp:
         flags += ["--mtp_depth", "2"]
@@ -165,7 +165,7 @@ def test_both_entrypoints_train_validate_and_save_wikipedia(wikipedia, tmp_path,
         with patch("sys.argv", [trainer.__file__, *flags]), \
              patch("model.CLIPVisionModel.from_pretrained", return_value=FakeVisionModel()), \
              patch("model.CLIPImageProcessor.from_pretrained", return_value=FakeVisionProcessor()), \
-             patch.object(trainer, "print_image_inference") as preview, \
+             patch("train.print_image_inference") as preview, \
              patch.object(trainer, "prepare_annotation_dataset") as annotations, \
              patch.object(trainer, "prepare_dataset") as legacy:
             trainer.main()

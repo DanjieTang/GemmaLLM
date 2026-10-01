@@ -25,7 +25,7 @@ def sweep_config(tmp_path):
         "data_root: data\ntrain_folders:\n  - train\n  - OpenImageV7_train\n"
         "val_folders:\n  - val\n  - OpenImageV7_val\n"
         "output_dir: checkpoints/annotation_sweep\nlr:\n  - 1e-3\n  - 3e-4\n"
-        "inference_every: 1000\ninference_max_new_tokens: 64\n"
+        "image_inference_every: 1000\ninference_max_new_tokens: 64\n"
     )
     return path
 
@@ -48,7 +48,7 @@ def test_folder_lists_stay_together_and_scalar_lists_sweep(sweep_config):
         assert args.val_folders == ["val", "OpenImageV7_val"]
         assert args.data_root == "data"
         assert args.project is None
-        assert args.inference_every == 1000
+        assert args.image_inference_every == 1000
         assert args.inference_max_new_tokens == 64
     assert len(directories) == 2
 
@@ -70,7 +70,7 @@ def test_sweep_dry_run_preserves_state_and_emits_usable_commands(tmp_path, sweep
     assert parsed[0].output_dir != parsed[1].output_dir
     assert all(args.output_dir.parent == Path("checkpoints/annotation_sweep")
                for args in parsed)
-    assert all(args.inference_every == 1000 and args.inference_max_new_tokens == 64
+    assert all(args.image_inference_every == 1000 and args.inference_max_new_tokens == 64
                for args in parsed)
     assert state.read_bytes() == before
     assert not (tmp_path / "checkpoints").exists()
@@ -152,13 +152,13 @@ def test_mtp_options_only_expand_enabled_runs(
 
 
 def test_inference_interval_can_be_swept_or_disabled():
-    config = OrderedDict(inference_every=[0, 1000, 2000])
+    config = OrderedDict(image_inference_every=[0, 1000, 2000])
     assert set(config) <= read_train_args(ROOT / "train.py")
     keys, values = normalize_grid(config)
     intervals = []
     for row in itertools.product(*values):
         cmd = build_command(sys.executable, ROOT / "train.py", dict(zip(keys, row)), "test")
-        intervals.append(parse_args(cmd[2:]).inference_every)
+        intervals.append(parse_args(cmd[2:]).image_inference_every)
     assert intervals == [0, 1000, 2000]
 
 

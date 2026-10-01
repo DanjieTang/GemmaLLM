@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from itertools import cycle, islice
+from itertools import islice
 import math
 from pathlib import Path
 
@@ -19,8 +19,8 @@ from lazy_dataloader import (
 )
 from model import MTPModule, VLM
 from train import (
-    build_parser, iter_validation_images, prepare_batch,
-    print_image_inference, validate_args,
+    build_inference_callbacks, build_parser, prepare_batch, run_inference_previews,
+    validate_args,
 )
 
 
@@ -143,8 +143,11 @@ class MTPTrainingModel(nn.Module):
 
 def run_epoch(model: MTPTrainingModel, loader, device: str, optimizer=None,
               scheduler=None, max_steps: int | None = None, start_step: int = 0,
-              inference_every: int = 0,
-              inference_callback: Callable[[int], None] | None = None) -> dict[str, float]:
+              image_inference_every: int = 0,
+              image_inference_callback: Callable[[int], None] | None = None,
+              text_inference_every: int = 0,
+              text_inference_callback: Callable[[int], None] | None = None,
+              ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
     main_sum, objective_sum, main_count = 0.0, 0.0, 0
@@ -173,9 +176,9 @@ def run_epoch(model: MTPTrainingModel, loader, device: str, optimizer=None,
                     draft_sums[index] += loss.item() * losses.mtp_counts[index]
                     draft_counts[index] += losses.mtp_counts[index]
             del loss, losses
-            if (training and inference_every and step % inference_every == 0
-                    and inference_callback is not None):
-                inference_callback(step)
+            if training:
+                run_inference_previews(step, image_inference_every, image_inference_callback,
+                                       text_inference_every, text_inference_callback)
     if not main_count:
         raise ValueError("Dataset contains no target tokens.")
     metrics = {"main_loss": main_sum / main_count,
@@ -287,20 +290,8 @@ def main():
             args.train_path, args.val_path, args.batch_size, args.batch_size,
             args.train_image_paths, args.val_image_paths,
         )
-    inference_callback = None
-    if args.inference_every:
-        if args.data_root or args.val_image_paths:
-            image_paths = cycle(iter_validation_images(val_loader.dataset))
-
-            def inference_callback(step: int) -> None:
-                image_path = next(image_paths, None)
-                if image_path is None:
-                    tqdm.write("Image inference skipped: no validation images available.")
-                    return
-                print_image_inference(base_model, tokenizer, image_path, step,
-                                      args.inference_max_new_tokens)
-        else:
-            print("Image inference disabled: text-only validation has no images.")
+    image_callback, text_callback = build_inference_callbacks(
+        args, base_model, tokenizer, val_loader)
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=args.weight_decay)
@@ -323,8 +314,10 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(model, train_loader, args.device, optimizer, scheduler,
                                   args.max_steps, start_step=global_step,
-                                  inference_every=args.inference_every,
-                                  inference_callback=inference_callback)
+                                  image_inference_every=args.image_inference_every,
+                                  image_inference_callback=image_callback,
+                                  text_inference_every=args.text_inference_every,
+                                  text_inference_callback=text_callback)
         global_step += steps_per_epoch
         val_metrics = run_epoch(model, val_loader, args.device, max_steps=args.max_steps)
         print(

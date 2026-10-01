@@ -135,7 +135,7 @@ def test_main_trains_saves_and_initializes_from_both_checkpoint_types(tmp_path, 
         "--max_context_length", "6", "--projection_dim", "4", "--head_dim", "2",
         "--q_head", "2", "--kv_head", "1", "--expansion_factor", "2",
         "--dropout_ratio", "0", "--mtp_depth", "2", "--max_steps", "1",
-        "--inference_every", "1", "--epochs", "2",
+        "--image_inference_every", "1", "--epochs", "2",
     ]
     if paired:
         for folder in ("train", "val"):
@@ -155,7 +155,7 @@ def test_main_trains_saves_and_initializes_from_both_checkpoint_types(tmp_path, 
         patch("train_mtp.parse_args", return_value=args),
         patch("train_mtp.AutoTokenizer.from_pretrained", return_value=tokenizer),
         patch("train_mtp.VLM", return_value=base),
-        patch("train_mtp.print_image_inference") as preview,
+        patch("train.print_image_inference") as preview,
     ):
         train_mtp.main()
     assert preview.call_count == (2 if paired else 0)
@@ -192,7 +192,7 @@ def test_validation_does_not_update_parameters_or_call_preview(tmp_path):
     before = {name: param.detach().clone() for name, param in model.named_parameters()}
     callback = Mock()
     metrics = train_mtp.run_epoch(model, [torch.tensor([[2, 4, 5, 1]])], "cpu",
-                                   inference_every=1, inference_callback=callback)
+                                   image_inference_every=1, image_inference_callback=callback)
     callback.assert_not_called()
     assert metrics["mtp_2_tokens"] == 1
     for name, param in model.named_parameters():

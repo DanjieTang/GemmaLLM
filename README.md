@@ -228,9 +228,16 @@ Train exclusively on the code-only corpus:
 ```bash
 uv run python train.py --coding_dir data/coding_multilingual_code_2048 \
   --embeddings_path data/gemma-4-31B-it-embeddings.pt \
-  --max_context_length 2048 --batch_size 1 --inference_every 0 \
+  --max_context_length 2048 --batch_size 1 \
   --output_dir checkpoints/coding_multilingual_code_2048
 ```
+
+To watch generations during training, add `--text_inference_every N`: every N
+iterations it prompts with a validation task through `### Response\n` and prints
+the greedy continuation beside the reference. Wikipedia windows are prompted with
+their first half. `--image_inference_every N` does the same for image
+annotations. Both are off by default, and `--inference_max_new_tokens` caps the
+generated length.
 
 For the 1,024-token build, point `--coding_dir` at
 `data/coding_multilingual_code_1024` and pass `--max_context_length 1024`. The

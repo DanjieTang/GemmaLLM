@@ -45,7 +45,10 @@ batch_size: 16
 
 # Generate and print one validation image annotation every N training iterations.
 # Iterations accumulate across epochs; 0 disables previews.
-inference_every: 1000
+image_inference_every: 1000
+# Greedily continue one validation text sample (coding prompt or the first half
+# of a Wikipedia window) every N training iterations; 0 disables previews.
+text_inference_every: 0
 inference_max_new_tokens: 256
 
 # Fixed hyperparameters produce a single run.
