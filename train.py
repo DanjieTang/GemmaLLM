@@ -1,4 +1,4 @@
-"""Train on image annotations, Wikipedia shards, or legacy token arrays."""
+"""Train on coding tasks, image annotations, Wikipedia, or legacy token arrays."""
 
 import argparse
 from collections.abc import Callable, Iterator
@@ -15,7 +15,8 @@ from transformers import AutoTokenizer
 
 from generate import generate
 from lazy_dataloader import (
-    AnnotationDataset, WikipediaDataset, prepare_annotation_dataset, prepare_dataset,
+    AnnotationDataset, CodingDataset, WikipediaDataset, prepare_annotation_dataset,
+    prepare_coding_dataset, prepare_dataset,
     prepare_mixed_dataset, prepare_wikipedia_dataset,
 )
 from model import VLM
@@ -33,6 +34,8 @@ def parse_bool(value: str) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     """Build the shared training CLI, allowing other trainers to add options."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--coding_dir", type=Path, default=None,
+                        help="Prepared coding-only corpus; excludes other data sources.")
     parser.add_argument("--data_root", type=str, default=None,
                         help="Parent of paired dataset folders (default: data).")
     parser.add_argument("--wikipedia_dir", type=Path, default=None,
@@ -53,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--num_layer", type=int, default=3)
     parser.add_argument("--max_context_length", type=int, default=256)
+    parser.add_argument("--pad_to_max_length", type=parse_bool, nargs="?", const=True,
+                        default=False, help="Pad every batch to --max_context_length "
+                                            "instead of its longest sample; accepts true/false.")
     parser.add_argument("--projection_dim", type=int, default=512)
     parser.add_argument("--expansion_factor", type=int, default=16)
     parser.add_argument("--head_dim", type=int, default=64)
@@ -121,6 +127,10 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
         parser.error("q_head must be divisible by kv_head and head_dim must be even.")
     legacy = args.train_path is not None or args.val_path is not None
     wikipedia = args.wikipedia_dir is not None
+    coding = args.coding_dir is not None
+    if coding and (legacy or wikipedia or args.data_root is not None
+                   or args.train_image_paths or args.val_image_paths):
+        parser.error("--coding_dir cannot be combined with other data sources.")
     if wikipedia and (legacy or args.train_image_paths or args.val_image_paths):
         parser.error("--wikipedia_dir cannot be combined with legacy token/image arrays.")
     if args.wikipedia_languages != ["all"]:
@@ -132,9 +142,11 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
             parser.error("--wikipedia_languages must be distinct.")
     if legacy and (args.train_path is None or args.val_path is None):
         parser.error("Legacy training requires both --train_path and --val_path.")
+    if legacy and args.pad_to_max_length:
+        parser.error("--pad_to_max_length does not apply to legacy fixed-width arrays.")
     if legacy and args.data_root is not None:
         parser.error("Choose --data_root or legacy --train_path/--val_path.")
-    if not legacy and not wikipedia and args.data_root is None:
+    if not legacy and not wikipedia and not coding and args.data_root is None:
         args.data_root = "data"
     if args.data_root is not None and (args.train_image_paths or args.val_image_paths):
         parser.error("--data_root discovers image paths; omit image-path manifests.")
@@ -169,7 +181,7 @@ def iter_validation_images(dataset) -> Iterator[str]:
     if isinstance(dataset, ConcatDataset):
         for child in dataset.datasets:
             yield from iter_validation_images(child)
-    elif isinstance(dataset, WikipediaDataset):
+    elif isinstance(dataset, (CodingDataset, WikipediaDataset)):
         return
     elif isinstance(dataset, AnnotationDataset):
         for _, image_path in dataset.samples:
@@ -276,24 +288,34 @@ def main():
         model.begin_fine_tunning()
     if max(tokenizer.get_vocab().values()) >= model.vocabulary_size:
         raise ValueError("Tokenizer IDs exceed the embedding matrix vocabulary.")
-    if args.wikipedia_dir is not None and args.data_root:
+    if args.coding_dir is not None:
+        train_loader, val_loader = prepare_coding_dataset(
+            args.coding_dir, args.batch_size, args.max_context_length,
+            model.vocabulary_size, tokenizer, num_workers=args.num_workers,
+            max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
+        )
+    elif args.wikipedia_dir is not None and args.data_root:
         train_loader, val_loader = prepare_mixed_dataset(
             args.data_root, args.train_folders, args.val_folders,
             args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
             args.max_context_length, model.vocabulary_size, tokenizer,
             num_workers=args.num_workers, max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
         )
     elif args.wikipedia_dir is not None:
         train_loader, val_loader = prepare_wikipedia_dataset(
             args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
             args.max_context_length, model.vocabulary_size, tokenizer,
             num_workers=args.num_workers, max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
         )
     elif args.data_root:
         train_loader, val_loader = prepare_annotation_dataset(
             args.data_root, args.train_folders, args.val_folders, args.batch_size,
             args.max_context_length, model.vocabulary_size, **special_ids,
             num_workers=args.num_workers, max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
         )
     else:
         train_loader, val_loader = prepare_dataset(
