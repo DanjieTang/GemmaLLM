@@ -1,0 +1,157 @@
+{
+  "date_utc": "2026-10-01",
+  "base_commit": "c81516f8f821c2b1cdd14ea58afb871603ff15b6",
+  "source_change_during_benchmark": "Only verification output formatting in main.cu; inference unchanged.",
+  "environment": {
+    "gpu": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "driver": "580.126.09",
+    "nvcc": "13.0.88",
+    "build_flags": "-O3 -std=c++17 -arch=native -lineinfo",
+    "platform": "Linux aarch64",
+    "python": "3.12.3",
+    "pytorch": "2.10.0+cu130",
+    "pytorch_cuda_runtime": "13.0",
+    "pytorch_float32_matmul_precision": "highest",
+    "pytorch_allow_tf32": false,
+    "pytorch_warning": "GB10 capability 12.1 exceeds the build reported maximum of 12.0; GPU runs and shared-weight verification succeeded."
+  },
+  "model": {
+    "num_layer": 4,
+    "projection_dim": 512,
+    "expansion_factor": 18,
+    "ffn_dim": 9216,
+    "q_head": 8,
+    "kv_head": 4,
+    "head_dim": 64,
+    "vocab_size": 262144,
+    "text_dim": 5376,
+    "embedding_dtype": "bfloat16",
+    "compute_dtype": "float32",
+    "use_moe": false,
+    "fine_tuning": false,
+    "mtp": false
+  },
+  "method": {
+    "batch_size": 1,
+    "prompt": [
+      2
+    ],
+    "warmup_generations": 1,
+    "timed_generations": 5,
+    "seed": 0,
+    "decoding": "greedy, KV cache, no EOS stopping",
+    "weights": "CUDA loads the random PyTorch weights exported from the 1024-total-token run. PyTorch 1025 run repeats seed 0 with identical model dimensions.",
+    "timing": "Synchronized wall time from prompt submission through final tokens on host; excludes model setup, weight loading/export, warmup and graph capture.",
+    "execution": "GPU benchmarks run sequentially.",
+    "interpretation": "Whole custom CUDA implementation versus eager PyTorch; cuBLAS is used by both, so this does not isolate the benefit of cuBLAS."
+  },
+  "verification": {
+    "reference_total_tokens": 1024,
+    "reference_prompt_length": 1,
+    "modes": [
+      "cuda_graph",
+      "cuda_no_graph"
+    ],
+    "post_prompt_logits_within_tolerance": 262144,
+    "post_prompt_logits_count": 262144,
+    "max_absolute_logit_error": 9.536743e-07,
+    "atol": 0.001,
+    "rtol": 0.001,
+    "matching_generated_tokens": 1023,
+    "focused_pytest_passed": 38,
+    "compileall_passed": true
+  },
+  "results": [
+    {
+      "implementation": "pytorch",
+      "total_tokens": 1024,
+      "generated_tokens": 1023,
+      "run_milliseconds_as_printed": [
+        4220.8,
+        4212.6,
+        4241.1,
+        4222.0,
+        4214.2
+      ],
+      "mean_seconds": 4.222153,
+      "generated_tokens_per_second": 242.293,
+      "sample_stddev_milliseconds_from_printed_runs": 11.351
+    },
+    {
+      "implementation": "cuda_graph",
+      "total_tokens": 1024,
+      "generated_tokens": 1023,
+      "run_milliseconds_as_printed": [
+        3354.7,
+        3355.5,
+        3354.2,
+        3353.0,
+        3358.6
+      ],
+      "mean_seconds": 3.35522,
+      "generated_tokens_per_second": 304.898,
+      "sample_stddev_milliseconds_from_printed_runs": 2.106
+    },
+    {
+      "implementation": "cuda_no_graph",
+      "total_tokens": 1024,
+      "generated_tokens": 1023,
+      "run_milliseconds_as_printed": [
+        3428.8,
+        3429.3,
+        3430.6,
+        3427.2,
+        3432.6
+      ],
+      "mean_seconds": 3.429705,
+      "generated_tokens_per_second": 298.276,
+      "sample_stddev_milliseconds_from_printed_runs": 2.027
+    },
+    {
+      "implementation": "pytorch",
+      "total_tokens": 1025,
+      "generated_tokens": 1024,
+      "run_milliseconds_as_printed": [
+        4217.5,
+        4219.4,
+        4219.0,
+        4215.4,
+        4215.0
+      ],
+      "mean_seconds": 4.217273,
+      "generated_tokens_per_second": 242.811,
+      "sample_stddev_milliseconds_from_printed_runs": 2.014
+    },
+    {
+      "implementation": "cuda_graph",
+      "total_tokens": 1025,
+      "generated_tokens": 1024,
+      "run_milliseconds_as_printed": [
+        3354.4,
+        3353.8,
+        3354.6,
+        3353.6,
+        3354.2
+      ],
+      "mean_seconds": 3.354115,
+      "generated_tokens_per_second": 305.297,
+      "sample_stddev_milliseconds_from_printed_runs": 0.415
+    },
+    {
+      "implementation": "cuda_no_graph",
+      "total_tokens": 1025,
+      "generated_tokens": 1024,
+      "run_milliseconds_as_printed": [
+        3431.7,
+        3432.3,
+        3432.0,
+        3437.6,
+        3430.3
+      ],
+      "mean_seconds": 3.43278,
+      "generated_tokens_per_second": 298.301,
+      "sample_stddev_milliseconds_from_printed_runs": 2.801
+    }
+  ]
+}
