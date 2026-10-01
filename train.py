@@ -86,9 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Limit examples per source per split for smoke tests.")
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Limit batches per training/validation epoch for smoke tests.")
-    parser.add_argument("--inference_every", type=int, default=1000,
+    parser.add_argument("--image_inference_every", type=int, default=0,
                         help="Generate one validation image annotation every N training "
-                             "iterations across epochs; 0 disables previews.")
+                             "iterations across epochs; 0 (default) disables previews.")
+    parser.add_argument("--text_inference_every", type=int, default=0,
+                        help="Continue one validation text sample every N training "
+                             "iterations across epochs; 0 (default) disables previews. "
+                             "Coding prompts end at '### Response'; other text uses "
+                             "its first half.")
     parser.add_argument("--inference_max_new_tokens", type=int, default=256,
                         help="Maximum generated tokens per preview, capped by model context.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else
@@ -110,8 +115,10 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
             parser.error(f"--{name} must be positive.")
     if args.num_workers < 0:
         parser.error("--num_workers cannot be negative.")
-    if args.inference_every < 0:
-        parser.error("--inference_every cannot be negative.")
+    if args.image_inference_every < 0:
+        parser.error("--image_inference_every cannot be negative.")
+    if args.text_inference_every < 0:
+        parser.error("--text_inference_every cannot be negative.")
     if not 0 <= args.dropout_ratio <= 1:
         parser.error("--dropout_ratio must be between 0 and 1.")
     if (not math.isfinite(args.load_balancing_loss_weight)
@@ -192,6 +199,55 @@ def iter_validation_images(dataset) -> Iterator[str]:
                 yield sample[1]
 
 
+def iter_validation_texts(dataset) -> Iterator[torch.Tensor]:
+    """Yield token IDs of text-only samples lazily; image annotations are skipped."""
+    if isinstance(dataset, ConcatDataset):
+        for child in dataset.datasets:
+            yield from iter_validation_texts(child)
+    elif isinstance(dataset, (CodingDataset, WikipediaDataset)):
+        for index in range(len(dataset)):
+            yield dataset[index][0]
+    elif not isinstance(dataset, AnnotationDataset):
+        for sample in dataset:
+            if not isinstance(sample, (tuple, list)):
+                yield sample
+            elif not sample[1]:
+                yield sample[0]
+
+
+def repeat_forever(make_iterator: Callable[[], Iterator]) -> Iterator:
+    """Restart an iterator after each pass without caching items like itertools.cycle."""
+    while True:
+        empty = True
+        for item in make_iterator():
+            empty = False
+            yield item
+        if empty:
+            return
+
+
+RESPONSE_MARKER = "### Response\n"
+
+
+def split_text_prompt(token_ids: torch.Tensor, tokenizer,
+                      max_context_length: int) -> tuple[list[int], str]:
+    """Return (prompt IDs, reference text) for a validation text preview.
+
+    Coding tasks are prompted with BOS and everything through RESPONSE_MARKER,
+    as at inference; other text is prompted with its first half.
+    """
+    ids = token_ids.tolist()
+    text = tokenizer.decode(ids, skip_special_tokens=True)
+    marker = text.find(RESPONSE_MARKER)
+    if ids[0] == tokenizer.bos_token_id and marker >= 0:
+        end = marker + len(RESPONSE_MARKER)
+        prompt = [tokenizer.bos_token_id] + tokenizer.encode(
+            text[:end], add_special_tokens=False)
+        return prompt[:max_context_length], text[end:]
+    half = min(max(1, len(ids) // 2), max_context_length)
+    return ids[:half], tokenizer.decode(ids[half:], skip_special_tokens=True)
+
+
 def print_image_inference(model: VLM, tokenizer, image_path: str, step: int,
                           max_new_tokens: int) -> None:
     """Decode from BOS and the image only; generate restores the training mode."""
@@ -204,10 +260,67 @@ def print_image_inference(model: VLM, tokenizer, image_path: str, step: int,
               f"Generated annotation: {annotation}", flush=True)
 
 
+def print_text_inference(model: VLM, tokenizer, token_ids: torch.Tensor, step: int,
+                         max_new_tokens: int) -> None:
+    """Greedily continue a validation text prompt and show the reference beside it."""
+    prompt, reference = split_text_prompt(token_ids, tokenizer, model.max_context_length)
+    tokens = generate(model, None, tokenizer.bos_token_id, tokenizer.eos_token_id,
+                      pad_token_id=tokenizer.pad_token_id, max_new_tokens=max_new_tokens,
+                      temperature=0.0, prompt_ids=prompt)
+    with tqdm.external_write_mode():
+        print(f"\n[Text inference | iteration {step}]\n"
+              f"Prompt: {tokenizer.decode(prompt, skip_special_tokens=True)}\n"
+              f"Generated: {tokenizer.decode(tokens, skip_special_tokens=True)}\n"
+              f"Reference: {reference}", flush=True)
+
+
+def build_inference_callbacks(args: argparse.Namespace, model: VLM, tokenizer,
+                              loader) -> tuple[Callable[[int], None] | None,
+                                               Callable[[int], None] | None]:
+    """Return (image, text) preview callbacks over loader.dataset, or None if off."""
+    image_callback = text_callback = None
+    if args.image_inference_every:
+        if args.data_root or args.val_image_paths:
+            image_paths = cycle(iter_validation_images(loader.dataset))
+
+            def image_callback(step: int) -> None:
+                image_path = next(image_paths, None)
+                if image_path is None:
+                    tqdm.write("Image inference skipped: no validation images available.")
+                    return
+                print_image_inference(model, tokenizer, image_path, step,
+                                      args.inference_max_new_tokens)
+        else:
+            print("Image inference disabled: text-only validation has no images.")
+    if args.text_inference_every:
+        texts = repeat_forever(lambda: iter_validation_texts(loader.dataset))
+
+        def text_callback(step: int) -> None:
+            token_ids = next(texts, None)
+            if token_ids is None:
+                tqdm.write("Text inference skipped: no validation text available.")
+                return
+            print_text_inference(model, tokenizer, token_ids, step,
+                                 args.inference_max_new_tokens)
+    return image_callback, text_callback
+
+
+def run_inference_previews(step: int, image_every: int,
+                           image_callback: Callable[[int], None] | None,
+                           text_every: int,
+                           text_callback: Callable[[int], None] | None) -> None:
+    """Run each enabled preview whose interval divides the global training step."""
+    for every, callback in ((image_every, image_callback), (text_every, text_callback)):
+        if every and step % every == 0 and callback is not None:
+            callback(step)
+
+
 def run_epoch(model, loader, device: str, optimizer=None, scheduler=None,
               max_steps: int | None = None, *, start_step: int = 0,
-              inference_every: int = 0,
-              inference_callback: Callable[[int], None] | None = None) -> float:
+              image_inference_every: int = 0,
+              image_inference_callback: Callable[[int], None] | None = None,
+              text_inference_every: int = 0,
+              text_inference_callback: Callable[[int], None] | None = None) -> float:
     training = optimizer is not None
     model.train(training)
     total_loss, total_tokens = 0.0, 0
@@ -234,9 +347,9 @@ def run_epoch(model, loader, device: str, optimizer=None, scheduler=None,
             total_tokens += count
             # Release the batch logits before allocating the generation cache.
             del logits, loss, auxiliary_loss
-            if (training and inference_every and step % inference_every == 0
-                    and inference_callback is not None):
-                inference_callback(step)
+            if training:
+                run_inference_previews(step, image_inference_every, image_inference_callback,
+                                       text_inference_every, text_inference_callback)
     if total_tokens == 0:
         raise ValueError("Dataset contains no target tokens.")
     return total_loss / total_tokens
@@ -322,20 +435,8 @@ def main():
             args.train_path, args.val_path, args.batch_size, args.batch_size,
             args.train_image_paths, args.val_image_paths,
         )
-    inference_callback = None
-    if args.inference_every:
-        if args.data_root or args.val_image_paths:
-            image_paths = cycle(iter_validation_images(val_loader.dataset))
-
-            def inference_callback(step: int) -> None:
-                image_path = next(image_paths, None)
-                if image_path is None:
-                    tqdm.write("Image inference skipped: no validation images available.")
-                    return
-                print_image_inference(model, tokenizer, image_path, step,
-                                      args.inference_max_new_tokens)
-        else:
-            print("Image inference disabled: text-only validation has no images.")
+    image_callback, text_callback = build_inference_callbacks(
+        args, model, tokenizer, val_loader)
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=args.weight_decay)
@@ -358,8 +459,10 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(model, train_loader, args.device, optimizer, scheduler,
                                args.max_steps, start_step=global_step,
-                               inference_every=args.inference_every,
-                               inference_callback=inference_callback)
+                               image_inference_every=args.image_inference_every,
+                               image_inference_callback=image_callback,
+                               text_inference_every=args.text_inference_every,
+                               text_inference_callback=text_callback)
         global_step += steps_per_epoch
         val_loss = run_epoch(model, val_loader, args.device, max_steps=args.max_steps)
         print(f"Epoch {epoch}: Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f}")

@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from model import VLM
-from train import main, parse_args, print_image_inference, run_epoch
+from generate import generate
+from lazy_dataloader import AnnotationDataset
+from train import (
+    iter_validation_texts, main, parse_args, print_image_inference, repeat_forever,
+    run_epoch, run_inference_previews, split_text_prompt,
+)
 from test_annotation_training import make_pair, tiny_model
 from test_vlm import FakeVisionModel, FakeVisionProcessor
 
@@ -23,7 +28,8 @@ from test_vlm import FakeVisionModel, FakeVisionProcessor
     ["--lora_rank", "0"],
     ["--lora_alpha", "-1"],
     ["--fine_tuning", "maybe"],
-    ["--inference_every", "-1"],
+    ["--image_inference_every", "-1"],
+    ["--text_inference_every", "-1"],
     ["--inference_max_new_tokens", "0"],
 ])
 def test_invalid_model_options_fail_early(flags):
@@ -40,9 +46,85 @@ def test_boolean_flags_accept_bare_and_explicit_values():
 
 
 def test_inference_defaults_and_disable():
-    assert parse_args([]).inference_every == 1000
+    assert parse_args([]).image_inference_every == 0
     assert parse_args([]).inference_max_new_tokens == 256
-    assert parse_args(["--inference_every", "0"]).inference_every == 0
+    assert parse_args(["--image_inference_every", "1000"]).image_inference_every == 1000
+    assert parse_args([]).text_inference_every == 0
+    assert parse_args(["--text_inference_every", "500"]).text_inference_every == 500
+
+
+class PieceTokenizer:
+    """Greedy longest-match tokenizer over fixed text pieces, for prompt splitting."""
+
+    bos_token_id, eos_token_id, pad_token_id = 2, 1, 0
+    pieces = ["<pad>", "<eos>", "<bos>", "### Instruction\n", "add", "\n\n",
+              "### Response\n", "x+y"]
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(self.pieces[i] for i in ids if not (skip_special_tokens and i < 3))
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        while text:
+            index = max((i for i in range(3, len(self.pieces))
+                         if text.startswith(self.pieces[i])),
+                        key=lambda i: len(self.pieces[i]))
+            ids.append(index)
+            text = text[len(self.pieces[index]):]
+        return ids
+
+
+def test_coding_prompt_ends_at_response_marker_and_text_uses_first_half():
+    tokenizer = PieceTokenizer()
+    coding = torch.tensor([2, 3, 4, 5, 6, 7, 1])
+    assert split_text_prompt(coding, tokenizer, 64) == ([2, 3, 4, 5, 6], "x+y")
+    # Without BOS and the marker (e.g. a Wikipedia window), prompt with the first half.
+    text = torch.tensor([4, 5, 4, 5, 7])
+    assert split_text_prompt(text, tokenizer, 64) == ([4, 5], "add\n\nx+y")
+    assert split_text_prompt(text, tokenizer, 1) == ([4], "\n\nadd\n\nx+y")
+
+
+def test_validation_texts_skip_images_and_repeat_without_caching(tmp_path):
+    annotations = AnnotationDataset.__new__(AnnotationDataset)
+    annotations.samples = [("tokens.npy", "image.png")]
+    legacy = [(torch.tensor([2, 4]), "image.png"), (torch.tensor([2, 5]), "")]
+    plain = [torch.tensor([2, 6])]
+    texts = [ids.tolist() for ids in iter_validation_texts(
+        torch.utils.data.ConcatDataset([annotations, legacy, plain]))]
+    assert texts == [[2, 5], [2, 6]]
+    repeated = repeat_forever(lambda: iter([1, 2]))
+    assert [next(repeated) for _ in range(5)] == [1, 2, 1, 2, 1]
+    assert next(repeat_forever(lambda: iter([])), None) is None
+
+
+def test_previews_run_on_their_own_intervals():
+    image, text = Mock(), Mock()
+    for step in range(1, 7):
+        run_inference_previews(step, 2, image, 3, text)
+    assert [call.args[0] for call in image.call_args_list] == [2, 4, 6]
+    assert [call.args[0] for call in text.call_args_list] == [3, 6]
+
+
+@torch.inference_mode()
+def test_text_generation_continues_prompt_without_images(tmp_path):
+    model, _ = tiny_model(tmp_path)
+    model.llm.classifier.bias[1] = -100  # Never stop early at EOS.
+    lengths = []
+    hook = model.llm.register_forward_pre_hook(
+        lambda module, args: lengths.append(args[0].shape[1]))
+    try:
+        with patch.object(model, "_encode_images") as encode:
+            tokens = generate(model, None, 2, 1, max_new_tokens=10, prompt_ids=[2, 4, 5, 6])
+            uncached = generate(model, None, 2, 1, max_new_tokens=10,
+                                prompt_ids=[2, 4, 5, 6], use_cache=False)
+        encode.assert_not_called()
+    finally:
+        hook.remove()
+    # Text only: no image prefix, and the 6-token context allows three new tokens.
+    assert lengths == [4, 1, 1, 4, 5, 6]
+    assert len(tokens) == 3 and tokens == uncached
+    with pytest.raises(ValueError, match="prompt_ids"):
+        generate(model, None, 2, 1, prompt_ids=[2] * 7)
 
 
 def test_main_previews_validation_images_across_epochs(tmp_path, capsys):
@@ -60,7 +142,7 @@ def test_main_previews_validation_images_across_epochs(tmp_path, capsys):
         "--train_folders", "train", "--val_folders", "val",
         "--output_dir", str(tmp_path / "output"), "--device", "cpu",
         "--epochs", "5", "--batch_size", "1", "--max_steps", "2",
-        "--max_context_length", "6", "--inference_every", "3",
+        "--max_context_length", "6", "--image_inference_every", "3",
         "--inference_max_new_tokens", "2",
     ])
     preview_modes = []
@@ -100,14 +182,14 @@ def test_main_previews_validation_images_across_epochs(tmp_path, capsys):
     assert output.count("Generated annotation: A generated annotation.") == 3
 
 
-@pytest.mark.parametrize("training,inference_every", [(True, 0), (False, 1)])
-def test_disabled_previews_and_validation_do_not_generate(tmp_path, training, inference_every):
+@pytest.mark.parametrize("training,image_inference_every", [(True, 0), (False, 1)])
+def test_disabled_previews_and_validation_do_not_generate(tmp_path, training, image_inference_every):
     model, _ = tiny_model(tmp_path)
     batch = torch.tensor([[2, 4, 1]])
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01) if training else None
     callback = Mock()
-    run_epoch(model, [batch], "cpu", optimizer, inference_every=inference_every,
-              inference_callback=callback)
+    run_epoch(model, [batch], "cpu", optimizer, image_inference_every=image_inference_every,
+              image_inference_callback=callback)
     callback.assert_not_called()
 
 
@@ -127,7 +209,7 @@ def test_main_trains_and_saves_all_model_settings(tmp_path, use_moe, fine_tuning
         "--load_balancing_loss_weight", "0.07",
         "--fine_tuning", str(fine_tuning), "--lora_rank", "2",
         "--lora_alpha", "6", "--max_steps", "1",
-        "--inference_every", "0",
+        "--image_inference_every", "0",
     ]
     batch = {
         "input_ids": torch.tensor([[2, 4, 5], [2, 6, 0]]),
