@@ -14,6 +14,84 @@ from data_preprocessing.tokenize_annotations import (
 )
 
 
+class CodingDataset(Dataset):
+    """Memory-map complete coding tasks, with no truncation or image inputs."""
+
+    def __init__(self, directory: str | Path, split: str, max_context_length: int,
+                 vocabulary_size: int, tokenizer, max_samples: int | None = None):
+        self.directory = Path(directory).expanduser() / split
+        manifest = json.loads((self.directory.parent / "manifest.json").read_text())
+        config = manifest["config"]
+        if config.get("format_version") != 1 or config.get("kind") != "coding":
+            raise ValueError("Expected a completed coding dataset manifest.")
+        special_ids = {key: getattr(tokenizer, key) for key in
+                       ("bos_token_id", "eos_token_id", "pad_token_id")}
+        if (not tokenizer.is_fast or config["special_token_ids"] != special_ids
+                or config["tokenizer_sha256"] != hashlib.sha256(
+                    tokenizer.backend_tokenizer.to_str().encode()).hexdigest()):
+            raise ValueError("Coding tokenizer differs from preprocessing.")
+        if not 1 <= config["context_length"] <= max_context_length:
+            raise ValueError("Coding context exceeds --max_context_length.")
+        self.context_length = config["context_length"]
+        self.vocabulary_size = vocabulary_size
+        self.bos_token_id = tokenizer.bos_token_id
+        self.eos_token_id = tokenizer.eos_token_id
+        self.tokens = np.load(self.directory / "tokens.npy", mmap_mode="r", allow_pickle=False)
+        self.offsets = np.load(self.directory / "offsets.npy", mmap_mode="r", allow_pickle=False)
+        stats = manifest["splits"][split]
+        if (self.tokens.dtype != np.int32 or self.tokens.shape != (stats["tokens"],)
+                or self.offsets.dtype != np.int64
+                or self.offsets.shape != (stats["tasks"] + 1,)
+                or self.offsets[0] != 0 or self.offsets[-1] != len(self.tokens)
+                or np.any(np.diff(self.offsets) < 2)
+                or np.any(np.diff(self.offsets) > min(
+                    config.get("max_tokens", self.context_length + 1),
+                    self.context_length + 1))):
+            raise ValueError("Invalid coding token arrays or task offsets.")
+        self.length = stats["tasks"]
+        if max_samples is not None:
+            if max_samples < 1:
+                raise ValueError("max_samples must be positive.")
+            self.length = min(self.length, max_samples)
+        if self.length < 1:
+            raise ValueError(f"No coding tasks in {split}.")
+        print(f"Coding {split}: {self.length:,} complete tasks", flush=True)
+
+    def __len__(self):
+        return self.length
+
+    def __getstate__(self):
+        return {**self.__dict__, "tokens": None, "offsets": None}
+
+    def __getitem__(self, index):
+        if not 0 <= index < self.length:
+            raise IndexError(index)
+        if self.tokens is None:
+            self.tokens = np.load(self.directory / "tokens.npy", mmap_mode="r", allow_pickle=False)
+            self.offsets = np.load(self.directory / "offsets.npy", mmap_mode="r", allow_pickle=False)
+        start, end = self.offsets[index:index + 2]
+        ids = self.tokens[start:end].astype(np.int64, copy=True)
+        if (ids.min() < 0 or ids.max() >= self.vocabulary_size
+                or ids[0] != self.bos_token_id or ids[-1] != self.eos_token_id):
+            raise ValueError("Invalid coding token IDs or BOS/EOS boundaries.")
+        return torch.from_numpy(ids), None
+
+
+def prepare_coding_dataset(
+    directory: str | Path, batch_size: int, max_context_length: int,
+    vocabulary_size: int, tokenizer, num_workers: int = 0,
+    max_samples: int | None = None, pad_to_max_length: bool = False,
+) -> tuple[DataLoader, DataLoader]:
+    datasets = [CodingDataset(directory, split, max_context_length, vocabulary_size,
+                              tokenizer, max_samples) for split in ("train", "val")]
+    kwargs = dict(batch_size=batch_size, num_workers=num_workers,
+                  collate_fn=partial(collate_annotations, pad_token_id=tokenizer.pad_token_id,
+                                     pad_to_length=max_context_length if pad_to_max_length
+                                     else None))
+    return (DataLoader(datasets[0], sampler=GlobalShuffleSampler(datasets[0]), **kwargs),
+            DataLoader(datasets[1], shuffle=False, **kwargs))
+
+
 class AnnotationDataset(Dataset):
     """Lazy token loading for images/annotations/input_ids in one or more splits."""
 
@@ -78,10 +156,20 @@ class AnnotationDataset(Dataset):
         return torch.from_numpy(ids), image_path
 
 
-def collate_annotations(batch, pad_token_id: int) -> dict:
-    """Right-pad shifted inputs and use -100 only for ignored target positions."""
+def collate_annotations(batch, pad_token_id: int,
+                        pad_to_length: int | None = None) -> dict:
+    """Right-pad shifted inputs and use -100 only for ignored target positions.
+
+    Pads to the longest sample, or to pad_to_length when given, so tensors
+    have shape [batch, pad_to_length].
+    """
     lengths = torch.tensor([len(tokens) - 1 for tokens, _ in batch])
-    shape = (len(batch), int(lengths.max()))
+    width = int(lengths.max())
+    if pad_to_length is not None:
+        if width > pad_to_length:
+            raise ValueError(f"Sample with {width} inputs exceeds pad length {pad_to_length}.")
+        width = pad_to_length
+    shape = (len(batch), width)
     inputs = torch.full(shape, pad_token_id, dtype=torch.long)
     labels = torch.full(shape, -100, dtype=torch.long)
     mask = torch.arange(shape[1])[None, :] < lengths[:, None]
@@ -98,6 +186,7 @@ def prepare_annotation_dataset(
     batch_size: int, max_context_length: int, vocabulary_size: int,
     bos_token_id: int, eos_token_id: int, pad_token_id: int,
     num_workers: int = 0, max_samples: int | None = None,
+    pad_to_max_length: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     train_paths = [Path(data_root) / name for name in train_folders]
     val_paths = [Path(data_root) / name for name in val_folders]
@@ -110,7 +199,9 @@ def prepare_annotation_dataset(
     val = AnnotationDataset(val_paths, **kwargs)
     loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers,
                          collate_fn=partial(collate_annotations,
-                                            pad_token_id=pad_token_id))
+                                            pad_token_id=pad_token_id,
+                                            pad_to_length=max_context_length
+                                            if pad_to_max_length else None))
     return (DataLoader(train, shuffle=True, **loader_kwargs),
             DataLoader(val, shuffle=False, **loader_kwargs))
 
@@ -305,6 +396,7 @@ def prepare_wikipedia_dataset(
     directory: str | Path, languages: list[str] | None, batch_size: int,
     max_context_length: int, vocabulary_size: int, tokenizer,
     num_workers: int = 0, max_samples: int | None = None,
+    pad_to_max_length: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """Load existing article splits; all completed languages are used by default."""
     directory = Path(directory).expanduser()
@@ -328,7 +420,9 @@ def prepare_wikipedia_dataset(
     ) for split in ("train", "val")]
     kwargs = dict(batch_size=batch_size, num_workers=num_workers,
                   collate_fn=partial(collate_annotations,
-                                     pad_token_id=tokenizer.pad_token_id))
+                                     pad_token_id=tokenizer.pad_token_id,
+                                     pad_to_length=max_context_length
+                                     if pad_to_max_length else None))
     return (DataLoader(datasets[0], sampler=WikipediaSampler(datasets[0]), **kwargs),
             DataLoader(datasets[1], shuffle=False, **kwargs))
 
@@ -358,6 +452,7 @@ def prepare_mixed_dataset(
     wikipedia_dir: str | Path, wikipedia_languages: list[str] | None,
     batch_size: int, max_context_length: int, vocabulary_size: int, tokenizer,
     num_workers: int = 0, max_samples: int | None = None,
+    pad_to_max_length: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """Combine annotations and Wikipedia within each split, shuffling training.
 
@@ -381,6 +476,8 @@ def prepare_mixed_dataset(
               f"{len(dataset.datasets[1]):,} Wikipedia windows", flush=True)
     kwargs = dict(batch_size=batch_size, num_workers=num_workers,
                   collate_fn=partial(collate_annotations,
-                                     pad_token_id=tokenizer.pad_token_id))
+                                     pad_token_id=tokenizer.pad_token_id,
+                                     pad_to_length=max_context_length
+                                     if pad_to_max_length else None))
     return (DataLoader(datasets[0], sampler=GlobalShuffleSampler(datasets[0]), **kwargs),
             DataLoader(datasets[1], shuffle=False, **kwargs))

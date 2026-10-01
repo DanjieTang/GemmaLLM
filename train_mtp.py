@@ -14,7 +14,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from lazy_dataloader import (
-    prepare_annotation_dataset, prepare_dataset, prepare_mixed_dataset,
+    prepare_annotation_dataset, prepare_coding_dataset, prepare_dataset, prepare_mixed_dataset,
     prepare_wikipedia_dataset,
 )
 from model import MTPModule, VLM
@@ -253,24 +253,34 @@ def main():
         load_initial_checkpoint(args.init_checkpoint, model, special_ids)
     if max(tokenizer.get_vocab().values()) >= base_model.vocabulary_size:
         raise ValueError("Tokenizer IDs exceed the embedding matrix vocabulary.")
-    if args.wikipedia_dir is not None and args.data_root:
+    if args.coding_dir is not None:
+        train_loader, val_loader = prepare_coding_dataset(
+            args.coding_dir, args.batch_size, args.max_context_length,
+            base_model.vocabulary_size, tokenizer, num_workers=args.num_workers,
+            max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
+        )
+    elif args.wikipedia_dir is not None and args.data_root:
         train_loader, val_loader = prepare_mixed_dataset(
             args.data_root, args.train_folders, args.val_folders,
             args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
             args.max_context_length, base_model.vocabulary_size, tokenizer,
             num_workers=args.num_workers, max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
         )
     elif args.wikipedia_dir is not None:
         train_loader, val_loader = prepare_wikipedia_dataset(
             args.wikipedia_dir, args.wikipedia_languages, args.batch_size,
             args.max_context_length, base_model.vocabulary_size, tokenizer,
             num_workers=args.num_workers, max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
         )
     elif args.data_root:
         train_loader, val_loader = prepare_annotation_dataset(
             args.data_root, args.train_folders, args.val_folders, args.batch_size,
             args.max_context_length, base_model.vocabulary_size, **special_ids,
             num_workers=args.num_workers, max_samples=args.max_samples,
+            pad_to_max_length=args.pad_to_max_length,
         )
     else:
         train_loader, val_loader = prepare_dataset(
