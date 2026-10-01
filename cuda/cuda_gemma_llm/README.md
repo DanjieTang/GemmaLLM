@@ -38,6 +38,66 @@ rest, including `--no_graph` and architecture overrides such as `--num_layer 8`.
 `max_context_length: 256` in the YAML is raised to `--total_tokens` automatically.
 In this model it only sizes the RoPE table and KV cache.
 
+## Measured results on NVIDIA GB10 (2026-10-01)
+
+The custom CUDA implementation took **3.354 seconds to generate 1024 new tokens**
+from one BOS token, compared with **4.217 seconds for eager PyTorch on the same
+GPU**: **1.26× faster**, or **20.5% less time**.
+
+Both interpretations of a "1024-token sequence" were measured. Each number is
+the mean of five timed generations after one untimed warmup, with batch size 1,
+greedy decoding, KV caching, and no EOS stopping:
+
+| Implementation | 1024 total tokens (1023 new) | 1025 total tokens (1024 new) | New tokens/s for 1024 new |
+| --- | ---: | ---: | ---: |
+| PyTorch, eager | 4.222 s | 4.217 s | 242.8 |
+| CUDA/cuBLAS, CUDA graphs | 3.355 s | 3.354 s | 305.3 |
+| CUDA/cuBLAS, `--no_graph` | 3.430 s | 3.433 s | 298.3 |
+
+This used the full architecture from `sweep_config.yaml`: 4 layers, hidden 512,
+FFN 9216, 8 query / 4 KV heads × 64, vocabulary 262144, and embedding width 5376.
+The decoder computed in FP32 with bf16 embedding storage. PyTorch reported
+`highest` float32 matmul precision and `allow_tf32=False`. MTP, MoE, LoRA, and
+image encoding were inactive. Model construction, weight loading/export, graph
+capture, and warmup are excluded; timings include returning tokens to the host.
+GPU workloads ran sequentially.
+
+CUDA loaded the exact random weights exported from PyTorch (seed 0). Verification
+passed in both graph and direct-launch modes: all 262144 post-prompt logits were
+within `atol=rtol=1e-3` (maximum absolute error `9.536743e-7`), and all 1023
+generated tokens in the 1024-total-token reference matched. The 1025-total-token
+PyTorch run recreated the same weights using seed 0. The focused Python tests
+passed (38 tests), as did the syntax check.
+
+The environment was Linux aarch64, Python 3.12.3, PyTorch 2.10.0+cu130, CUDA
+compiler 13.0.88, and NVIDIA driver 580.126.09. CUDA was built with
+`-O3 -std=c++17 -arch=native -lineinfo`. PyTorch emitted a capability warning
+because GB10 is 12.1 and its build reports a maximum of 12.0; all GPU runs and
+the shared-weight verification completed successfully. Results apply to this
+installed environment. Per-run measurements and metadata are saved in
+[benchmark_results_gb10.json](benchmark_results_gb10.json).
+
+This measures the combined effect of the custom implementation's kernel fusion,
+cache allocation, token synchronization, and CUDA graphs. PyTorch already uses
+cuBLAS for CUDA BLAS operations ([PyTorch backend documentation](https://docs.pytorch.org/docs/2.10/backends.html#torch.backends.cuda.preferred_blas_library)),
+so the measured ratio does not isolate cuBLAS's contribution. CUDA graphs alone
+reduced the custom implementation's time by about 2.3% for 1024 new tokens.
+
+To repeat with shared random weights, run from the repository root (use
+`--total_tokens 1024` throughout for the prompt-inclusive measurement):
+
+```bash
+uv sync --locked
+make -C cuda/cuda_gemma_llm
+uv run python cuda/cuda_gemma_llm/benchmark_pytorch.py \
+    --device cuda --total_tokens 1025 --warmup 1 --runs 5 \
+    --export_dir .cache/cuda_gemma_benchmark/weights
+cuda/cuda_gemma_llm/gemma_llm --weights .cache/cuda_gemma_benchmark/weights \
+    --verify --total_tokens 1025 --warmup 1 --runs 5
+cuda/cuda_gemma_llm/gemma_llm --weights .cache/cuda_gemma_benchmark/weights \
+    --no_graph --total_tokens 1025 --warmup 1 --runs 5
+```
+
 ## What is compared
 
 Both sides do the same work per token:

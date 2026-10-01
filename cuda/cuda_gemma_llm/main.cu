@@ -79,9 +79,14 @@ bool verify(GemmaLLM& model, const std::string& directory, bool use_graph) {
         max_error = std::max(max_error, error);
         if (!std::isfinite(logits[i]) || error > atol + rtol * std::abs(expected_logits[i])) ++mismatches;
     }
-    std::cout << "Logits after the prompt: max |CUDA - PyTorch| = " << max_error << ", "
+    const auto previous_flags = std::cout.flags();
+    const auto previous_precision = std::cout.precision();
+    std::cout << std::scientific << std::setprecision(6)
+              << "Logits after the prompt: max |CUDA - PyTorch| = " << max_error << ", "
               << logits.size() - mismatches << "/" << logits.size() << " within atol=" << atol
               << " rtol=" << rtol << " -> " << (mismatches ? "FAIL" : "PASS") << "\n";
+    std::cout.flags(previous_flags);
+    std::cout.precision(previous_precision);
 
     int matching = prompt_length;
     while (matching < int(tokens.size()) && tokens[matching] == expected[matching]) ++matching;
